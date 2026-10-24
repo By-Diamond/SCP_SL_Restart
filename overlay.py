@@ -4,10 +4,10 @@
 两种用途共用一个类，靠参数区分：
 * 人数条：duration=None + 白色 16px
 * 重启提示：duration=10 + 红色 28px 粗体
-窗口全程鼠标穿透，不会吃掉游戏里的点击。
+窗口默认全程鼠标穿透，不会吃掉游戏里的点击；用户解锁人数条后允许拖动。
 """
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import QWidget
 
@@ -15,6 +15,8 @@ FONT_FAMILIES = ["Microsoft YaHei UI", "Microsoft YaHei", "SimHei", "sans-serif"
 
 
 class Overlay(QWidget):
+    position_changed = Signal(int, int)
+
     def __init__(self, pos, font_px, duration=None, color="#FFFFFF",
                  bold=False, alpha=150):
         super().__init__()
@@ -25,6 +27,8 @@ class Overlay(QWidget):
         self.pad_x = max(4, font_px // 2)
         self.pad_y = max(2, font_px // 4)
         self.lines = [""]
+        self._movable = False
+        self._drag_offset = None
 
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
@@ -47,6 +51,19 @@ class Overlay(QWidget):
         self._timer.timeout.connect(self._fade_out)
 
     # ------------------------------ 对外 ------------------------------
+
+    def set_movable(self, flag):
+        """仅在用户解锁时接收鼠标；切换窗口标志后恢复原来的显隐状态。"""
+        self._movable = bool(flag)
+        self._drag_offset = None
+        visible = self.isVisible()
+        self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, not self._movable)
+        self.setCursor(Qt.CursorShape.OpenHandCursor if self._movable
+                       else Qt.CursorShape.ArrowCursor)
+        self.setToolTip("按住左键拖动；在托盘菜单取消‘移动人数条’后恢复鼠标穿透。"
+                        if self._movable else "")
+        self.set_visible(visible)
+        self.update()
 
     def set_text(self, text, ensure_shown=True):
         """更新内容并按需重排尺寸；人数条每秒走这里。"""
@@ -84,6 +101,33 @@ class Overlay(QWidget):
 
     # ------------------------------ 内部 ------------------------------
 
+    def mousePressEvent(self, event):
+        if self._movable and event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.pos()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            self._pos = (self.x(), self.y())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._drag_offset is not None and event.button() == Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            self._pos = (self.x(), self.y())
+            self._drag_offset = None
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.position_changed.emit(*self._pos)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
     def _fit(self):
         fm = self.fontMetrics()
         w = max(fm.horizontalAdvance(line) for line in self.lines) if self.lines else 0
@@ -106,6 +150,10 @@ class Overlay(QWidget):
         p.setBrush(QColor(0, 0, 0, self.alpha))
         r = self.rect().adjusted(0, 0, -1, -1)
         p.drawRoundedRect(r, 4, 4)
+        if self._movable:
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QColor("#5CB8FF"))
+            p.drawRoundedRect(r, 4, 4)
         p.setPen(self.color)
         p.setFont(self.font())
         p.drawText(self.rect().adjusted(self.pad_x, self.pad_y, -self.pad_x, -self.pad_y),

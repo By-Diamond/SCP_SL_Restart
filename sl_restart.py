@@ -46,6 +46,7 @@ class App:
         self.counter = Overlay(cfg["counter_pos"], cfg["counter_font"],
                                duration=None, color="#FFFFFF", bold=False,
                                alpha=cfg["alpha"])
+        self.counter.position_changed.connect(self._save_counter_position)
         self.toast = Overlay(cfg["restart_pos"], cfg["restart_font"],
                              duration=cfg["restart_seconds"],
                              color=cfg["restart_color"], bold=True,
@@ -72,6 +73,8 @@ class App:
         t.add("counter", "显示人数条",
               lambda: self._toggle_counter(t.acts["counter"].isChecked()),
               checkable=True, checked=True)
+        t.add("move_counter", "移动人数条", self._toggle_move_counter,
+              checkable=True)
         t.add("pause", "暂停监控", lambda: self._toggle_pause())
         t.add("refresh", "立即刷新", self.monitor.refresh_now)
         t.sep()
@@ -93,6 +96,19 @@ class App:
         self.tray.set_text("pause", "继续监控" if paused else "暂停监控")
         self.tray.tip("SL Restart · " + ("已暂停" if paused else self.monitor.snapshot["text"]))
         config.log("[ui] %s监控" % ("暂停" if paused else "继续"))
+
+    def _toggle_move_counter(self):
+        movable = self.tray.acts["move_counter"].isChecked()
+        self.counter.set_movable(movable)
+        if movable:
+            self._toggle_counter(True)
+
+    def _save_counter_position(self, x, y):
+        self.cfg["counter_pos"] = [x, y]
+        try:
+            config.save(self.cfg)
+        except Exception as e:
+            config.log("[ui] 保存人数条位置失败：%r" % e)
 
     def _toggle_autostart(self):
         want = self.tray.acts["autostart"].isChecked()
