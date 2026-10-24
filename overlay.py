@@ -16,6 +16,7 @@ FONT_FAMILIES = ["Microsoft YaHei UI", "Microsoft YaHei", "SimHei", "sans-serif"
 
 class Overlay(QWidget):
     position_changed = Signal(int, int)
+    position_moved = Signal(int, int)
 
     def __init__(self, pos, font_px, duration=None, color="#FFFFFF",
                  bold=False, alpha=150):
@@ -51,6 +52,11 @@ class Overlay(QWidget):
         self._timer.timeout.connect(self._fade_out)
 
     # ------------------------------ 对外 ------------------------------
+
+    def set_position(self, pos):
+        """同步当前位置与下次显示的位置，隐藏的提示也随人数条移动。"""
+        self._pos = (int(pos[0]), int(pos[1]))
+        self.move(*self._pos)
 
     def set_movable(self, flag):
         """仅在用户解锁时接收鼠标；切换窗口标志后恢复原来的显隐状态。"""
@@ -113,6 +119,7 @@ class Overlay(QWidget):
         if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
             self.move(event.globalPosition().toPoint() - self._drag_offset)
             self._pos = (self.x(), self.y())
+            self.position_moved.emit(*self._pos)
             event.accept()
             return
         super().mouseMoveEvent(event)

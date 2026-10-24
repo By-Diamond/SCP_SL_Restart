@@ -68,8 +68,12 @@ class DragTests(unittest.TestCase):
             event = QMouseEvent(kind, QPointF(local), QPointF(target + local),
                                 button, buttons, Qt.KeyboardModifier.NoModifier)
             QApplication.sendEvent(counter, event)
+            self.assertEqual(self.ui.toast.pos(), target + QPoint(0, 38))
         self.assertEqual(counter.pos(), target)
         self.assertEqual(config.load()["counter_pos"], [target.x(), target.y()])
+        self.assertEqual(config.load()["restart_pos"], [target.x(), target.y() + 38])
+        self.ui.toast.pop("[1服] 重启")
+        self.assertEqual(self.ui.toast.pos(), target + QPoint(0, 38))
         counter.set_text("[更新后的服务器] 42人")
         self.ui._toggle_counter(False)
         self.ui._toggle_counter(True)
@@ -81,6 +85,30 @@ class DragTests(unittest.TestCase):
         self.dialogs.append(reloaded)
         reloaded.set_visible(True)
         self.assertEqual(reloaded.pos(), target)
+
+    def test_visible_toast_follows_and_old_position_is_repaired(self):
+        self.ui.toast.pop("[3服] 重启")
+        self.ui.counter.position_moved.emit(320, 180)
+        self.assertEqual(self.ui.toast.pos(), QPoint(320, 218))
+        self.ui._save_counter_position(320, 180)
+        self.ui.toast.hide()
+        self.ui.counter.set_position((320, 180))
+        self.ui._push_restart(["1服"])
+        self.assertEqual(self.ui.toast.pos(), QPoint(320, 218))
+        cfg = config.load()
+        cfg["counter_pos"] = [400, 250]
+        cfg["restart_pos"] = [10, 48]
+        with patch("sl_restart.Monitor.start"), patch("sl_restart.Tray.show"), \
+                patch("sl_restart.autostart.is_enabled", return_value=False):
+            restored = App(cfg, self.app)
+        restored.timer.stop()
+        self.dialogs.extend([restored.counter, restored.toast])
+        try:
+            self.assertEqual(restored.toast.pos(), QPoint(400, 288))
+        finally:
+            restored.monitor.stop()
+            restored.alerts.stop()
+            restored.tray.icon.hide()
 
     def test_unlock_hidden_counter(self):
         self.ui._toggle_counter(False)

@@ -52,8 +52,8 @@ def main():
     pump(app, 0.5)
     t = ui.tray
 
-    check("托盘菜单八项齐全",
-          set(t.acts) == {"counter", "move_counter", "pause", "refresh", "servers", "autostart", "about", "quit"},
+    check("托盘菜单九项齐全",
+          set(t.acts) == {"counter", "move_counter", "pause", "refresh", "servers", "alerts", "autostart", "about", "quit"},
           sorted(t.acts))
     check("菜单文案：显示人数条 / 暂停监控 / 立即刷新 / 编辑服务器清单… / 开机自启 / 关于 / 退出程序",
           [t.acts[k].text() for k in ("counter", "pause", "refresh", "servers", "autostart", "about", "quit")]
