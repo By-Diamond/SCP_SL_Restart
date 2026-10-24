@@ -29,6 +29,10 @@ DEFAULTS = {
     "restart_seconds": 10,      # 重启提示显示秒数
     "restart_color": "#FF3B3B",  # 重启提示字色（红）
     "alpha": 150,               # 半透明黑底不透明度 0-255
+    "sound_enabled": False,     # 重启提示音（默认关闭）
+    "sound_file": "",           # 自定义音频绝对路径；留空使用系统提示音
+    "sound_volume": 70,         # 提示音音量 0-100
+    "windows_notifications": False,  # Windows 通知中心提醒（默认关闭）
 }
 
 _BASE = None                    # 测试时用 set_base_dir 改写到临时目录
@@ -98,6 +102,15 @@ def load():
         pass
     good = normalize_servers(cfg.get("servers"))
     cfg["servers"] = good or [dict(s) for s in DEFAULTS["servers"]]
+    for key in ("sound_enabled", "windows_notifications"):
+        if not isinstance(cfg[key], bool):
+            cfg[key] = DEFAULTS[key]
+    if not isinstance(cfg["sound_file"], str):
+        cfg["sound_file"] = ""
+    try:
+        cfg["sound_volume"] = max(0, min(100, int(cfg["sound_volume"])))
+    except (TypeError, ValueError, OverflowError):
+        cfg["sound_volume"] = DEFAULTS["sound_volume"]
     return cfg
 
 

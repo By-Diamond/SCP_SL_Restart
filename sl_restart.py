@@ -14,6 +14,8 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 import autostart
 import config
 from about import AboutDialog
+from alert_dialog import AlertDialog
+from alerts import RestartAlerts
 from monitor import Monitor
 from overlay import Overlay
 from server_dialog import ServersDialog
@@ -43,10 +45,12 @@ class App:
         self.cfg = cfg
         self.app = app
         self.monitor = Monitor(cfg)
+        self.alerts = RestartAlerts(app)
         self.counter = Overlay(cfg["counter_pos"], cfg["counter_font"],
                                duration=None, color="#FFFFFF", bold=False,
                                alpha=cfg["alpha"])
         self.counter.position_changed.connect(self._save_counter_position)
+        self.counter.position_moved.connect(self._position_toast)
         self.toast = Overlay(cfg["restart_pos"], cfg["restart_font"],
                              duration=cfg["restart_seconds"],
                              color=cfg["restart_color"], bold=True,
@@ -57,6 +61,7 @@ class App:
 
         self.counter.set_text(self.monitor.snapshot["text"])
         self.counter.set_visible(True)
+        self._position_toast(*cfg["counter_pos"])
         self.tray.tip("SL Restart · 启动中…")
         self.tray.show()
         self.tray.on_click(lambda: self._toggle_counter(not self.counter.isVisible()))
@@ -79,6 +84,7 @@ class App:
         t.add("refresh", "立即刷新", self.monitor.refresh_now)
         t.sep()
         t.add("servers", "编辑服务器清单…", self._edit_servers)
+        t.add("alerts", "提醒设置…", self._edit_alerts)
         t.add("autostart", "开机自启", self._toggle_autostart,
               checkable=True, checked=autostart.is_enabled())
         t.sep()
@@ -105,10 +111,31 @@ class App:
 
     def _save_counter_position(self, x, y):
         self.cfg["counter_pos"] = [x, y]
+        self._position_toast(x, y)
+        self.cfg["restart_pos"] = [self.toast.x(), self.toast.y()]
         try:
             config.save(self.cfg)
         except Exception as e:
             config.log("[ui] 保存人数条位置失败：%r" % e)
+
+    def _position_toast(self, x, y):
+        gap = max(38, self.counter.height() + 8)
+        self.toast.set_position((x, y + gap))
+
+    def _edit_alerts(self):
+        dlg = AlertDialog(self.cfg, self.alerts)
+        if dlg.exec() != AlertDialog.DialogCode.Accepted:
+            return
+        updated = dict(self.cfg, **dlg.result_settings())
+        try:
+            config.save(updated)
+        except Exception as e:
+            config.log("[ui] 保存提醒设置失败：%r" % e)
+            QMessageBox.warning(None, "保存失败", "提醒设置未保存，请检查程序目录是否可写。")
+            return
+        self.cfg.update(dlg.result_settings())
+        if not self.cfg["sound_enabled"]:
+            self.alerts.stop_sound()
 
     def _toggle_autostart(self):
         want = self.tray.acts["autostart"].isChecked()
@@ -140,6 +167,7 @@ class App:
 
     def quit(self):
         self.monitor.stop()
+        self.alerts.stop()
         self.app.quit()
 
     # ------------------------------ 同步 ------------------------------
@@ -163,7 +191,9 @@ class App:
         for n in names:
             if n not in self._toast_names:
                 self._toast_names.append(n)
+        self._position_toast(self.counter.x(), self.counter.y())
         self.toast.pop("%s 重启" % " ".join("[%s]" % n for n in self._toast_names))
+        self.alerts.notify_restart(names, self.cfg)
         config.log("[ui] 弹重启提示：%s" % " ".join(names))
 
 
@@ -173,6 +203,8 @@ def main(argv=None):
                     help="开发用：跑 N 秒后自动退出（验证用）")
     ap.add_argument("--about-grab", metavar="PNG", default="",
                     help="开发用：把关于窗口画成 PNG 后退出（验证打包后可用）")
+    ap.add_argument("--alerts-grab", metavar="PNG", default="",
+                    help="开发用：把提醒设置画成 PNG 后退出（不播放声音或发送通知）")
     args = ap.parse_args(argv)
 
     cfg = config.load()
@@ -180,6 +212,9 @@ def main(argv=None):
     app.setApplicationName("SL Restart")
     app.setApplicationVersion(config.VERSION)
     app.setQuitOnLastWindowClosed(False)
+
+    if args.alerts_grab:
+        return 0 if AlertDialog(cfg).grab().save(args.alerts_grab) else 1
 
     if args.about_grab:
         from about import AboutDialog
