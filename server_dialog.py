@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QDialog, QDialogButtonBox,
                                QHBoxLayout, QHeaderView, QLabel, QMessageBox,
                                QPushButton, QTableWidget, QTableWidgetItem,
                                QVBoxLayout)
+from PySide6.QtCore import Qt
 
 import config
 
@@ -20,6 +21,13 @@ class ServersDialog(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        header = self.table.verticalHeader()
+        header.setSectionsMovable(True)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        header.setFixedWidth(48)
+        header.setCursor(Qt.CursorShape.OpenHandCursor)
+        header.setToolTip("按住序号前的 ≡ 拖动，调整服务器顺序")
+        header.sectionMoved.connect(self._update_row_numbers)
         for s in servers:
             self._add_row(s.get("addr", ""), s.get("name", ""))
 
@@ -43,7 +51,8 @@ class ServersDialog(QDialog):
         box.rejected.connect(self.reject)
 
         lay = QVBoxLayout(self)
-        lay.addWidget(QLabel("地址格式：IP:端口，例如 180.188.21.179:7777"))
+        lay.addWidget(QLabel("地址格式：IP:端口，例如 180.188.21.179:7777\n"
+                            "按住序号前的 ≡ 上下拖动排序，点确定保存。"))
         lay.addLayout(body, 1)
         lay.addWidget(box)
 
@@ -53,17 +62,26 @@ class ServersDialog(QDialog):
         self.table.setItem(r, 0, QTableWidgetItem(str(addr)))
         self.table.setItem(r, 1, QTableWidgetItem(str(name)))
         self.table.setCurrentCell(r, 0)
+        self._update_row_numbers()
+
+    def _update_row_numbers(self, *_args):
+        header = self.table.verticalHeader()
+        for visual in range(self.table.rowCount()):
+            logical = header.logicalIndex(visual)
+            self.table.setVerticalHeaderItem(logical, QTableWidgetItem("≡  %d" % (visual + 1)))
 
     def _del_row(self):
         rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
         if not rows and self.table.rowCount():
-            rows = [self.table.rowCount() - 1]
+            rows = [self.table.verticalHeader().logicalIndex(self.table.rowCount() - 1)]
         for r in rows:
             self.table.removeRow(r)
+        self._update_row_numbers()
 
     def result_servers(self):
         rows = []
-        for r in range(self.table.rowCount()):
+        for visual in range(self.table.rowCount()):
+            r = self.table.verticalHeader().logicalIndex(visual)
             addr_item = self.table.item(r, 0)
             name_item = self.table.item(r, 1)
             rows.append({"addr": addr_item.text() if addr_item else "",
