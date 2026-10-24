@@ -16,7 +16,8 @@ from PySide6.QtCore import QProcess
 from PySide6.QtWidgets import QApplication
 
 import config
-from alerts import RestartAlerts, notification_command
+from alerts import (NOTIFICATION_APP_ID, RestartAlerts, notification_command,
+                    register_notification_shortcut)
 from alert_dialog import AlertDialog
 from sl_restart import App
 
@@ -86,18 +87,69 @@ class AlertTests(unittest.TestCase):
         root = ET.fromstring(base64.b64decode(encoded_xml))
         self.assertEqual([e.text for e in root.findall("./visual/binding/text")], [title, message])
         self.assertEqual(root.find("audio").attrib["silent"], "true")
-        self.assertIn("CreateToastNotifier('SL Restart')", script)
+        self.assertIn("CreateToastNotifier('ByDiamond.SLRestart')", script)
+        self.assertNotIn(" ", NOTIFICATION_APP_ID)
+        self.assertLessEqual(len(NOTIFICATION_APP_ID), 128)
+
+    def test_notification_registers_app_identity_before_sending(self):
+        script = base64.b64decode(notification_command("title", "message")[-1]).decode("utf-16-le")
+        self.assertIn(r"HKCU:\Software\Classes\AppUserModelId\ByDiamond.SLRestart", script)
+        self.assertIn("-Name DisplayName", script)
+        self.assertLess(script.index("-Name DisplayName"), script.index("CreateToastNotifier"))
+        self.assertIn("$notifier.Setting", script)
+        self.assertIn("if ($setting -and $setting -ne 'Enabled')", script)
+        self.assertNotIn("$notifier.Setting.ToString()", script)
+        self.assertNotIn("-Name Enabled", script)
+
+    def test_disabled_notification_reports_blocked_instead_of_success(self):
+        from unittest.mock import Mock
+        process = Mock()
+        process.readAllStandardOutput.return_value = b"SL_RESTART_NOTIFICATION_BLOCKED:DisabledForApplication"
+        messages = []
+        self.alerts.status.connect(messages.append)
+        self.alerts._notification_finished(process, 2)
+        self.assertIn("Windows 已关闭此应用的通知", messages[-1])
 
     def test_notification_uses_async_process_and_cleans_up(self):
         with patch("alerts.sys.platform", "win32"), patch("alerts.os.path.isfile", return_value=True), \
-                patch.object(QProcess, "start") as start:
+                patch.object(QProcess, "start") as start, \
+                patch("alerts.register_notification_shortcut") as register:
             self.alerts.show_notification("标题", "内容")
+            register.assert_called_once()
             start.assert_called_once()
             process = next(iter(self.alerts._processes))
             self.assertTrue(process.program().endswith("powershell.exe"))
             self.assertEqual(process.arguments(), notification_command("标题", "内容"))
             process.finished.emit(0, QProcess.ExitStatus.NormalExit)
             self.assertFalse(self.alerts._processes)
+
+    def test_shortcut_registration_failure_is_reported(self):
+        messages = []
+        self.alerts.status.connect(messages.append)
+        with patch("alerts.sys.platform", "win32"), patch("alerts.os.path.isfile", return_value=True), \
+                patch("alerts.register_notification_shortcut", side_effect=OSError("access denied")), \
+                patch.object(QProcess, "start") as start:
+            self.alerts.show_notification("标题", "内容")
+            start.assert_not_called()
+        self.assertIn("注册 Windows 通知身份失败", messages[-1])
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows shell shortcut")
+    def test_shortcut_targets_current_executable_and_valid_app_id(self):
+        import pythoncom
+        from win32com.propsys import pscon
+        with patch("pythoncom.CoInitialize"), patch("pythoncom.CoUninitialize"), \
+                patch("pythoncom.CoCreateInstance") as create, \
+                patch("win32com.shell.shell.SHGetFolderPath", return_value=self.tmp.name), \
+                patch("alerts.sys.frozen", True, create=True):
+            register_notification_shortcut()
+            link = create.return_value
+            link.SetPath.assert_called_once_with(os.path.abspath(sys.executable))
+            link.SetArguments.assert_called_once_with("")
+            property_key, value = link.QueryInterface.return_value.SetValue.call_args.args
+            self.assertEqual(property_key, pscon.PKEY_AppUserModel_ID)
+            self.assertEqual(value.GetValue(), NOTIFICATION_APP_ID)
+            link.QueryInterface.return_value.Save.assert_called_once_with(
+                os.path.join(self.tmp.name, "SL Restart Notifications.lnk"), True)
 
     def test_settings_cancel_does_not_save(self):
         with patch("sl_restart.Monitor.start"), patch("sl_restart.Tray.show"), \

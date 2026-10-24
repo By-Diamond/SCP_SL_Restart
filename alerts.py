@@ -3,6 +3,7 @@
 
 import base64
 import os
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
@@ -11,6 +12,41 @@ from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import QApplication
 
 import config
+
+NOTIFICATION_APP_ID = "ByDiamond.SLRestart"
+
+
+def register_notification_shortcut():
+    """按 Windows 桌面通知要求注册当前用户的开始菜单快捷方式和 AUMID。"""
+    import pythoncom
+    from win32com.propsys import propsys, pscon
+    from win32com.shell import shell, shellcon
+
+    executable = os.path.abspath(sys.executable)
+    arguments = ""
+    if not getattr(sys, "frozen", False):
+        windowed = os.path.join(os.path.dirname(executable), "pythonw.exe")
+        if os.path.isfile(windowed):
+            executable = windowed
+        arguments = subprocess.list2cmdline([os.path.join(os.path.dirname(__file__), "sl_restart.py")])
+    pythoncom.CoInitialize()
+    try:
+        programs = shell.SHGetFolderPath(0, shellcon.CSIDL_PROGRAMS, None, 0)
+        os.makedirs(programs, exist_ok=True)
+        link = pythoncom.CoCreateInstance(shell.CLSID_ShellLink, None,
+                                         pythoncom.CLSCTX_INPROC_SERVER, shell.IID_IShellLink)
+        link.SetPath(executable)
+        link.SetArguments(arguments)
+        link.SetWorkingDirectory(config.base_dir())
+        link.SetDescription("SL Restart 服务器重启提醒")
+        store = link.QueryInterface(propsys.IID_IPropertyStore)
+        store.SetValue(pscon.PKEY_AppUserModel_ID,
+                       propsys.PROPVARIANTType(NOTIFICATION_APP_ID, pythoncom.VT_LPWSTR))
+        store.Commit()
+        link.QueryInterface(pythoncom.IID_IPersistFile).Save(
+            os.path.join(programs, "SL Restart Notifications.lnk"), True)
+    finally:
+        pythoncom.CoUninitialize()
 
 
 def default_sound_file():
@@ -30,7 +66,12 @@ def notification_command(title, message):
     ET.SubElement(binding, "text").text = str(message)
     ET.SubElement(toast, "audio", silent="true")
     encoded_xml = base64.b64encode(ET.tostring(toast, encoding="utf-8")).decode("ascii")
-    script = """$ErrorActionPreference = 'Stop'
+    script = r"""$ErrorActionPreference = 'Stop'
+$appKey = 'HKCU:\Software\Classes\AppUserModelId\%s'
+if (-not (Test-Path -LiteralPath $appKey)) {
+    New-Item -Path $appKey -Force | Out-Null
+}
+New-ItemProperty -LiteralPath $appKey -Name DisplayName -Value 'SL Restart' -PropertyType String -Force | Out-Null
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
@@ -40,8 +81,15 @@ $xml.LoadXml($xmlText)
 $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
 $toast.Tag = 'restart'
 $toast.Group = 'servers'
-[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('SL Restart').Show($toast)
-""" % encoded_xml
+$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('%s')
+$setting = [string]$notifier.Setting
+if ($setting -and $setting -ne 'Enabled') {
+    Write-Output ('SL_RESTART_NOTIFICATION_BLOCKED:' + $setting)
+    exit 2
+}
+$notifier.Show($toast)
+Write-Output 'SL_RESTART_NOTIFICATION_SENT'
+""" % (NOTIFICATION_APP_ID, encoded_xml, NOTIFICATION_APP_ID)
     return ["-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
             "-EncodedCommand", base64.b64encode(script.encode("utf-16-le")).decode("ascii")]
 
@@ -57,6 +105,7 @@ class RestartAlerts(QObject):
         self._custom_sound = False
         self._volume = 70
         self._play_id = 0
+        self._identity_registered = False
 
     def notify_restart(self, names, cfg):
         if not names:
@@ -115,11 +164,20 @@ class RestartAlerts(QObject):
         if len(self._processes) >= 3:
             config.log("[alerts] 系统通知仍在发送，跳过本次通知")
             return
+        if not self._identity_registered:
+            try:
+                register_notification_shortcut()
+                self._identity_registered = True
+            except Exception as e:
+                config.log("[alerts] 注册 Windows 通知身份失败：%r" % e)
+                self.status.emit("注册 Windows 通知身份失败，请查看运行日志。")
+                return
         process = QProcess(self)
         self._processes.add(process)
         process.setProgram(executable)
         process.setArguments(notification_command(title, message))
         process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        config.log("[alerts] 请求 Windows 通知：%s" % title)
         timeout = QTimer(process)
         timeout.setSingleShot(True)
         timeout.timeout.connect(lambda: self._notification_timeout(process))
@@ -145,8 +203,17 @@ class RestartAlerts(QObject):
         if code:
             details = bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace")
             config.log("[alerts] Windows 通知失败（%d）：%s" % (code, details[:2000]))
-            self.status.emit("Windows 通知发送失败，请查看运行日志。")
+            reasons = {
+                "DisabledForApplication": "Windows 已关闭此应用的通知，请在系统通知设置中开启 SL Restart。",
+                "DisabledForUser": "Windows 已关闭当前用户的通知，请检查系统通知设置。",
+                "DisabledByGroupPolicy": "Windows 通知被系统策略禁用。",
+                "DisabledByManifest": "Windows 未识别应用的通知身份，请查看运行日志。",
+            }
+            reason = next((text for setting, text in reasons.items() if setting in details),
+                          "Windows 通知发送失败，请查看运行日志。")
+            self.status.emit(reason)
         else:
+            config.log("[alerts] Windows 已接受通知请求（不代表横幅已显示）")
             self.status.emit("通知已提交 Windows；显示方式由系统通知设置控制。")
         self._processes.discard(process)
         process.deleteLater()

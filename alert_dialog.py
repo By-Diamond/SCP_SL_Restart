@@ -3,7 +3,8 @@
 
 import os
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
                                QHBoxLayout, QLabel, QLineEdit, QMessageBox,
                                QPushButton, QSlider, QVBoxLayout)
@@ -54,9 +55,12 @@ class AlertDialog(QDialog):
         self.notifications_enabled.setChecked(cfg.get("windows_notifications", False))
         test_notification = QPushButton("测试通知")
         test_notification.clicked.connect(self._test_notification)
+        system_settings = QPushButton("系统通知设置…")
+        system_settings.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("ms-settings:notifications")))
         notifications = QHBoxLayout()
         notifications.addWidget(self.notifications_enabled, 1)
         notifications.addWidget(test_notification)
+        notifications.addWidget(system_settings)
 
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
