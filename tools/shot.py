@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""开发用：离屏把两个覆盖窗画到灰底上导出 PNG，自己检查配色/位置/错开。
+"""开发用：离屏把覆盖窗画到灰底上导出 PNG，自己检查配色/位置/错开。
 
 用法（Windows Python）：python tools\\shot.py [输出目录]
+想用真实平台字体（不外弹窗口）跑一遍：set QT_QPA_PLATFORM=windows && python tools\\shot.py ...
 """
 
 import os
@@ -17,13 +18,20 @@ from PySide6.QtGui import QColor, QImage, QPainter  # noqa: E402
 from PySide6.QtWidgets import QApplication          # noqa: E402
 
 import config                                      # noqa: E402
+import monitor                                      # noqa: E402
 from overlay import Overlay                        # noqa: E402
 
-COUNTER = "[1服] 41人  |  [3服] -人  |  [5服] 19人"
+# 用户给的样式：1服刚重启（0:01）、3服查不到、5服已经打了 21 分钟（>20 分钟 -> 黄）
+COUNTER_ROWS = [("1服", 40, 1, True), ("3服", None, 0, False), ("5服", 19, 1260, True)]
 TOASTS = ["[3服] 重启", "[1服] 重启"]
 
 
-def compose(app, widgets, path, bg, size=(620, 140)):
+def counter_segments(cfg):
+    yellow = cfg["timer_color"]
+    return [(t, yellow if k else None) for t, k in monitor.format_segments(COUNTER_ROWS)]
+
+
+def compose(widgets, path, bg, size):
     img = QImage(size[0], size[1], QImage.Format.Format_ARGB32)
     img.fill(QColor(bg))
     p = QPainter(img)
@@ -39,12 +47,13 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     app = QApplication(sys.argv[:1])
     cfg = config.load()
+    segs = counter_segments(cfg)
 
-    def build(counter_text, toast_text):
+    def build(toast_text):
         c = Overlay(cfg["counter_pos"], cfg["counter_font"], None, "#FFFFFF", False, cfg["alpha"])
         t = Overlay(cfg["restart_pos"], cfg["restart_font"], cfg["restart_seconds"],
                     cfg["restart_color"], True, cfg["alpha"])
-        c.set_text(counter_text)
+        c.set_segments(segs)
         t.pop(toast_text)
         c.show()
         t.show()
@@ -52,26 +61,28 @@ def main():
         return c, t
 
     for idx, bg in enumerate(("#2b2f36", "#9aa3ad", "#1f5d2f")):
-        c, t = build(COUNTER, TOASTS[0])
-        compose(app, (c, t), os.path.join(out_dir, "shot_%d_counter_toast.png" % idx), bg)
+        c, t = build(TOASTS[0])
+        compose((c, t), os.path.join(out_dir, "shot_%d_counter_toast.png" % idx), bg,
+                (max(c.width(), t.width()) + 24, t.y() + t.height() + 12))
         for w in (c, t):
             w.hide()
             w.deleteLater()
 
     # 只有人数条（没重启提示）时的样子
     c = Overlay(cfg["counter_pos"], cfg["counter_font"], None, "#FFFFFF", False, cfg["alpha"])
-    c.set_text(COUNTER)
+    c.set_segments(segs)
     c.show()
     app.processEvents()
-    compose(app, (c,), os.path.join(out_dir, "shot_counter_only.png"), "#2b2f36")
+    compose((c,), os.path.join(out_dir, "shot_counter_only.png"), "#2b2f36",
+            (c.width() + 24, c.height() + 24))
 
     # 几何检查：人数条底边 < 重启提示顶边
-    c.set_text(COUNTER)
-    c2, t2 = build(COUNTER, TOASTS[1])
+    c2, t2 = build(TOASTS[1])
     gap = t2.y() - (c2.y() + c2.height())
     print("人数条 %dx%d @%s ；重启提示 @y=%d 高=%d ；间距 %.1f px"
           % (c2.width(), c2.height(), cfg["counter_pos"], t2.y(), t2.height(), gap))
     assert gap > 0, "两个覆盖窗重叠了！"
+    print("人数条文案：%s" % "".join(t for t, _ in segs))
 
     # 关于窗口单独出一张，方便肉眼检查排版/配色
     from about import AboutDialog                   # noqa: E402
@@ -85,16 +96,30 @@ def main():
     print("%s  (%dx%d)" % (out, img.width(), img.height()))
     dlg.hide()
 
+    # 编辑服务器清单：新增的「显示时长」列长什么样
+    from server_dialog import ServersDialog         # noqa: E402
+    sdlg = ServersDialog([{"addr": "180.188.21.179:7777", "name": "1服", "timer": True},
+                          {"addr": "180.188.21.179:7779", "name": "3服", "timer": True},
+                          {"addr": "180.188.21.179:7781", "name": "5服", "timer": False}])
+    sdlg.show()
+    app.processEvents()
+    img = sdlg.grab()
+    out = os.path.join(out_dir, "shot_servers_dialog.png")
+    assert img.save(out), out
+    print("%s  (%dx%d)" % (out, img.width(), img.height()))
+    sdlg.hide()
+
     # 多台服同时重启时的样子：服名并排（只是变宽，高度不变）
-    c4 = Overlay(cfg["counter_pos"], cfg["counter_font"], None, "#FFFFFF", False, cfg["alpha"])
     t4 = Overlay(cfg["restart_pos"], cfg["restart_font"], cfg["restart_seconds"],
                  cfg["restart_color"], True, cfg["alpha"])
-    c4.set_text(COUNTER)
+    c4 = Overlay(cfg["counter_pos"], cfg["counter_font"], None, "#FFFFFF", False, cfg["alpha"])
+    c4.set_segments(segs)
     t4.pop("[1服] [3服] [5服] 重启")
     c4.show()
     t4.show()
     app.processEvents()
-    compose(app, (c4, t4), os.path.join(out_dir, "shot_multi_toast.png"), "#1b2027", size=(620, 140))
+    compose((c4, t4), os.path.join(out_dir, "shot_multi_toast.png"), "#1b2027",
+            (max(c4.width(), t4.width()) + 24, t4.y() + t4.height() + 12))
     single = Overlay(cfg["restart_pos"], cfg["restart_font"], cfg["restart_seconds"],
                      cfg["restart_color"], True, cfg["alpha"])
     single.pop("[1服] 重启")
@@ -106,8 +131,9 @@ def main():
     # README 里用的预览图：深色底 + 刚好装下两个窗的画布（这是示意图，不是真机截图）
     img_dir = config.path("images")
     os.makedirs(img_dir, exist_ok=True)
-    c3, t3 = build(COUNTER, TOASTS[0])
-    compose(app, (c3, t3), os.path.join(img_dir, "preview.png"), "#1b2027", size=(420, 104))
+    c3, t3 = build(TOASTS[0])
+    compose((c3, t3), os.path.join(img_dir, "preview.png"), "#1b2027",
+            (max(c3.width(), t3.width()) + 20, t3.y() + t3.height() + 10))
     return 0
 
 

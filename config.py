@@ -11,17 +11,21 @@ import os
 import sys
 from datetime import datetime
 
-VERSION = "0.1.0"               # 单一来源：关于窗口用它；tools/version_info.txt 需手工同步
+VERSION = "0.3.0"               # 单一来源：关于窗口用它；tools/version_info.txt 需手工同步
 
 DEFAULTS = {
     "servers": [
-        {"addr": "180.188.21.179:7777", "name": "1服"},
-        {"addr": "180.188.21.179:7779", "name": "3服"},
-        {"addr": "180.188.21.179:7781", "name": "5服"},
+        {"addr": "180.188.21.179:7777", "name": "1服", "timer": True},
+        {"addr": "180.188.21.179:7779", "name": "3服", "timer": True},
+        {"addr": "180.188.21.179:7781", "name": "5服", "timer": True},
     ],
     "interval": 1.0,            # 轮询间隔（秒）
     "timeout": 0.5,             # 单次等待（秒）
     "retries": 1,               # 抗丢包重试次数
+    "offline_fails": 2,         # 连续失败几次才算「服务器下线」（防抖动误报重启）
+    "show_timer": True,         # 回合时长计时器总开关（托盘菜单可切）
+    "timer_color": "#FFD400",   # 时长超阈值后的字色（黄）
+    "timer_yellow_after": 1200,  # 时长多少秒后转黄（20 分钟）
     "counter_pos": [10, 10],    # 人数条位置
     "restart_pos": [10, 48],    # 重启提示位置（让开人数条）
     "counter_font": 16,         # 人数条字号
@@ -71,7 +75,10 @@ def parse_addr(s):
 
 
 def normalize_servers(rows):
-    """只留地址合法的项；同地址只保留第一条；服名为空则回落成「端口服」。"""
+    """只留地址合法的项；同地址只保留第一条；服名为空则回落成「端口服」。
+
+    `timer` = 这台服是否显示回合时长（缺省开，兼容老的 settings.json）。
+    """
     out, seen = [], set()
     for r in rows or []:
         if not isinstance(r, dict):
@@ -85,7 +92,7 @@ def normalize_servers(rows):
             continue
         seen.add(addr)
         name = str(r.get("name") or "").strip() or "%d服" % port
-        out.append({"addr": addr, "name": name})
+        out.append({"addr": addr, "name": name, "timer": bool(r.get("timer", True))})
     return out
 
 

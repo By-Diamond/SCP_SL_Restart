@@ -1,25 +1,30 @@
 # -*- coding: utf-8 -*-
-"""编辑服务器清单：两列（地址 / 服名），支持增删行。"""
+"""编辑服务器清单：三列（地址 / 服名 / 是否显示回合时长），支持增删行和拖动排序。"""
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QAbstractItemView, QDialog, QDialogButtonBox,
                                QHBoxLayout, QHeaderView, QLabel, QMessageBox,
                                QPushButton, QTableWidget, QTableWidgetItem,
                                QVBoxLayout)
-from PySide6.QtCore import Qt
 
 import config
+
+COL_TIMER = 2
 
 
 class ServersDialog(QDialog):
     def __init__(self, servers, parent=None):
         super().__init__(parent)
         self.setWindowTitle("编辑服务器清单")
-        self.resize(520, 320)
+        self.resize(620, 320)
 
-        self.table = QTableWidget(0, 2, self)
-        self.table.setHorizontalHeaderLabels(["地址（IP:端口）", "服名"])
+        self.table = QTableWidget(0, 3, self)
+        self.table.setHorizontalHeaderLabels(["地址（IP:端口）", "服名", "显示时长"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(COL_TIMER, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeaderItem(COL_TIMER).setTextAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         header = self.table.verticalHeader()
         header.setSectionsMovable(True)
@@ -29,7 +34,7 @@ class ServersDialog(QDialog):
         header.setToolTip("按住序号前的 ≡ 拖动，调整服务器顺序")
         header.sectionMoved.connect(self._update_row_numbers)
         for s in servers:
-            self._add_row(s.get("addr", ""), s.get("name", ""))
+            self._add_row(s.get("addr", ""), s.get("name", ""), s.get("timer", True))
 
         add_btn = QPushButton("添加")
         del_btn = QPushButton("删除选中")
@@ -52,19 +57,27 @@ class ServersDialog(QDialog):
 
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel("地址格式：IP:端口，例如 180.188.21.179:7777\n"
-                            "按住序号前的 ≡ 上下拖动排序，点确定保存。"))
+                             "按住序号前的 ≡ 上下拖动排序，点确定保存。"))
+        lay.addWidget(QLabel("「显示时长」勾上的服，人数条上会跟一个回合时长（超过 20 分钟变黄）。"))
         lay.addLayout(body, 1)
         lay.addWidget(box)
 
-    def _add_row(self, addr, name):
+    def _add_row(self, addr, name, timer=True):
         r = self.table.rowCount()
         self.table.insertRow(r)
         self.table.setItem(r, 0, QTableWidgetItem(str(addr)))
         self.table.setItem(r, 1, QTableWidgetItem(str(name)))
+        item = QTableWidgetItem()
+        item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
+                      | Qt.ItemFlag.ItemIsSelectable)
+        item.setCheckState(Qt.CheckState.Checked if timer else Qt.CheckState.Unchecked)
+        item.setToolTip("勾上：这台服在人数条上显示回合时长")
+        self.table.setItem(r, COL_TIMER, item)
         self.table.setCurrentCell(r, 0)
         self._update_row_numbers()
 
     def _update_row_numbers(self, *_args):
+        """行首显示「≡  序号」；拖动排序后按可视顺序重排编号。"""
         header = self.table.verticalHeader()
         for visual in range(self.table.rowCount()):
             logical = header.logicalIndex(visual)
@@ -79,13 +92,18 @@ class ServersDialog(QDialog):
         self._update_row_numbers()
 
     def result_servers(self):
+        """按**可视顺序**（用户拖出来的顺序）读出各行。"""
         rows = []
+        header = self.table.verticalHeader()
         for visual in range(self.table.rowCount()):
-            r = self.table.verticalHeader().logicalIndex(visual)
+            r = header.logicalIndex(visual)
             addr_item = self.table.item(r, 0)
             name_item = self.table.item(r, 1)
+            timer_item = self.table.item(r, COL_TIMER)
             rows.append({"addr": addr_item.text() if addr_item else "",
-                         "name": name_item.text() if name_item else ""})
+                         "name": name_item.text() if name_item else "",
+                         "timer": bool(timer_item
+                                       and timer_item.checkState() == Qt.CheckState.Checked)})
         return config.normalize_servers(rows)
 
     def accept(self):

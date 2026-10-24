@@ -7,17 +7,16 @@ import sys
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PySide6.QtCore import QProcess
 from PySide6.QtWidgets import QApplication
 
 import config
-from alerts import (NOTIFICATION_APP_ID, RestartAlerts, notification_command,
-                    register_notification_shortcut)
+from alerts import (NOTIFICATION_APP_ID, RestartAlerts, build_toast_xml,
+                    notification_command, register_notification_identity)
 from alert_dialog import AlertDialog
 from sl_restart import App
 
@@ -60,96 +59,142 @@ class AlertTests(unittest.TestCase):
         self.assertFalse(loaded["sound_enabled"])
 
     def test_independent_switches_and_batching(self):
+        events = [("1服", "1.1.1.1:7777"), ("3服", "1.1.1.1:7779")]
         with patch.object(self.alerts, "play_sound") as sound, \
                 patch.object(self.alerts, "show_notification") as notify:
-            self.alerts.notify_restart(["1服", "3服"], self.cfg)
+            self.alerts.notify_restart(events, self.cfg)
             sound.assert_not_called()
             notify.assert_not_called()
             self.cfg["sound_enabled"] = True
-            self.alerts.notify_restart(["1服", "3服"], self.cfg)
+            self.alerts.notify_restart(events, self.cfg)
             sound.assert_called_once_with("", 70)
             notify.assert_not_called()
             sound.reset_mock()
             self.cfg.update(sound_enabled=False, windows_notifications=True)
-            self.alerts.notify_restart(["1服", "3服"], self.cfg)
+            self.alerts.notify_restart(events, self.cfg)
             sound.assert_not_called()
-            notify.assert_called_once_with("SCP:SL 服务器重启", "[1服] [3服] 重启")
+            # 一台服一条通知，标题/正文维持原样式，各自带对应服的进服链接
+            self.assertEqual(notify.call_count, 2)
+            first = notify.call_args_list[0]
+            self.assertEqual(first.args[0], "SCP:SL 服务器重启")
+            self.assertEqual(first.args[1], "[1服] 重启")
+            self.assertEqual(first.kwargs["join_url"], "slrestart://join/1.1.1.1:7777")
+            second = notify.call_args_list[1]
+            self.assertEqual(second.args[1], "[3服] 重启")
+            self.assertEqual(second.kwargs["join_url"], "slrestart://join/1.1.1.1:7779")
 
-    def test_notification_encoding_and_xml_escape(self):
+    def test_notification_xml_escape_and_static_command(self):
         title = "SCP:SL 重启"
         message = "[<服&名>] ' ; $(calc)\n新一行"
-        args = notification_command(title, message)
-        self.assertIn("Hidden", args)
-        self.assertNotIn("-Command", args)
-        script = base64.b64decode(args[-1]).decode("utf-16-le")
-        self.assertNotIn(message, script)
-        encoded_xml = script.split("FromBase64String('", 1)[1].split("')", 1)[0]
-        root = ET.fromstring(base64.b64decode(encoded_xml))
+        xml = build_toast_xml(title, message)
+        root = ET.fromstring(xml)
         self.assertEqual([e.text for e in root.findall("./visual/binding/text")], [title, message])
         self.assertEqual(root.find("audio").attrib["silent"], "true")
-        self.assertIn("CreateToastNotifier('ByDiamond.SLRestart')", script)
+        # 脚本静态：启动参数（含 EncodedCommand）每次完全相同，数据走环境变量
+        args = notification_command()
+        self.assertEqual(notification_command(), args)
+        self.assertNotIn("-Command", args)
+        self.assertIn("-EncodedCommand", args)
+        script = base64.b64decode(args[-1]).decode("utf-16-le")
+        self.assertNotIn(message, script)
+        self.assertNotIn(title, script)
+        self.assertIn("$xml.LoadXml($env:OPB_XML)", script)
+        self.assertIn("CreateToastNotifier($env:OPB_AUMID)", script)
         self.assertNotIn(" ", NOTIFICATION_APP_ID)
         self.assertLessEqual(len(NOTIFICATION_APP_ID), 128)
 
-    def test_notification_registers_app_identity_before_sending(self):
-        script = base64.b64decode(notification_command("title", "message")[-1]).decode("utf-16-le")
-        self.assertIn(r"HKCU:\Software\Classes\AppUserModelId\ByDiamond.SLRestart", script)
-        self.assertIn("-Name DisplayName", script)
-        self.assertLess(script.index("-Name DisplayName"), script.index("CreateToastNotifier"))
+    def test_toast_button_join_url(self):
+        url = "slrestart://join/1.2.3.4:7777"
+        root = ET.fromstring(build_toast_xml("[3服] 重启", "内容", url))
+        self.assertEqual(root.attrib["activationType"], "protocol")
+        self.assertEqual(root.attrib["activation"], url)      # 点通知本体 = 进服
+        action = root.find("./actions/action")
+        self.assertEqual(action.attrib["content"], "进服")
+        self.assertEqual(action.attrib["arguments"], url)     # 点按钮 = 进服那一台
+        # 不带链接的通知（提醒设置里的「测试通知」）没有按钮
+        plain = ET.fromstring(build_toast_xml("标题", "内容"))
+        self.assertNotIn("activationType", plain.attrib)
+        self.assertIsNone(plain.find("./actions"))
+
+    def test_join_protocol_registered_for_buttons(self):
+        import winreg
+        with patch("winreg.CreateKey") as create, patch("winreg.SetValueEx") as set_value:
+            create.return_value.__enter__ = lambda self: create.return_value
+            create.return_value.__exit__ = lambda self, *args: False
+            register_notification_identity()
+        paths = [call.args[1] for call in create.call_args_list]
+        self.assertIn(r"Software\Classes\slrestart", paths)
+        self.assertIn(r"Software\Classes\slrestart\shell\open\command", paths)
+        values = [call.args[1] for call in set_value.call_args_list]
+        self.assertIn("URL Protocol", values)
+
+    def test_join_url_cli_joins_and_exits(self):
+        import sl_restart
+        with patch("sl_restart.joiner.join") as join:
+            join.return_value = (True, "steam://connect/1.2.3.4:7777")
+            rc = sl_restart.main(["sl_restart.py", "slrestart://join/1.2.3.4:7777"])
+        self.assertEqual(rc, 0)
+        join.assert_called_once_with("1.2.3.4:7777")
+        with patch("sl_restart.joiner.join") as join:
+            rc = sl_restart.main(["sl_restart.py", "slrestart://join/坏地址"])
+            self.assertEqual(rc, 0)
+            join.assert_not_called()
+
+    def test_script_checks_setting_before_showing(self):
+        script = base64.b64decode(notification_command()[-1]).decode("utf-16-le")
         self.assertIn("$notifier.Setting", script)
         self.assertIn("if ($setting -and $setting -ne 'Enabled')", script)
         self.assertNotIn("$notifier.Setting.ToString()", script)
-        self.assertNotIn("-Name Enabled", script)
+        self.assertNotIn("-Name DisplayName", script)   # 注册表改由 winreg 写，脚本不再碰
 
-    def test_disabled_notification_reports_blocked_instead_of_success(self):
-        from unittest.mock import Mock
-        process = Mock()
-        process.readAllStandardOutput.return_value = b"SL_RESTART_NOTIFICATION_BLOCKED:DisabledForApplication"
+    def test_aumid_written_via_winreg_with_display_name(self):
+        import winreg
+        with patch("winreg.CreateKey") as create, patch("winreg.SetValueEx") as set_value:
+            create.return_value.__enter__ = lambda self: create.return_value
+            create.return_value.__exit__ = lambda self, *args: False
+            ok, _msg = register_notification_identity()
+        self.assertTrue(ok)
+        paths = [call.args[1] for call in create.call_args_list]
+        self.assertTrue(any(NOTIFICATION_APP_ID in p for p in paths))
+        names = [call.args[1] for call in set_value.call_args_list]
+        self.assertIn("DisplayName", names)
+
+    def test_blocked_notification_reports_blocked_instead_of_success(self):
         messages = []
         self.alerts.status.connect(messages.append)
-        self.alerts._notification_finished(process, 2)
+        self.alerts._report_notification_result(
+            2, "SL_RESTART_NOTIFICATION_BLOCKED:DisabledForApplication", "")
         self.assertIn("Windows 已关闭此应用的通知", messages[-1])
 
-    def test_notification_uses_async_process_and_cleans_up(self):
-        with patch("alerts.sys.platform", "win32"), patch("alerts.os.path.isfile", return_value=True), \
-                patch.object(QProcess, "start") as start, \
-                patch("alerts.register_notification_shortcut") as register:
+    def test_notification_uses_worker_thread_and_cleans_up(self):
+        with patch("alerts.sys.platform", "win32"), \
+                patch("alerts._powershell_exe", return_value=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"), \
+                patch("alerts.subprocess.run") as run, \
+                patch("alerts.register_notification_identity") as register:
+            run.return_value = Mock(returncode=0,
+                                    stdout="SL_RESTART_NOTIFICATION_SENT", stderr="")
             self.alerts.show_notification("标题", "内容")
             register.assert_called_once()
-            start.assert_called_once()
-            process = next(iter(self.alerts._processes))
-            self.assertTrue(process.program().endswith("powershell.exe"))
-            self.assertEqual(process.arguments(), notification_command("标题", "内容"))
-            process.finished.emit(0, QProcess.ExitStatus.NormalExit)
-            self.assertFalse(self.alerts._processes)
+            self.alerts.stop()                       # join 后台线程后再断言
+            self.assertTrue(run.called)
+            kwargs = run.call_args.kwargs
+            self.assertEqual(kwargs["creationflags"], 0x08000000)   # CREATE_NO_WINDOW，不闪黑窗
+            self.assertEqual(kwargs["env"]["OPB_AUMID"], NOTIFICATION_APP_ID)
+            self.assertIn("标题", kwargs["env"]["OPB_XML"])          # 数据走环境变量，不进脚本
+            self.assertFalse([t for t in self.alerts._threads if t.is_alive()])
 
-    def test_shortcut_registration_failure_is_reported(self):
+    def test_aumid_failure_does_not_block_sending(self):
         messages = []
         self.alerts.status.connect(messages.append)
-        with patch("alerts.sys.platform", "win32"), patch("alerts.os.path.isfile", return_value=True), \
-                patch("alerts.register_notification_shortcut", side_effect=OSError("access denied")), \
-                patch.object(QProcess, "start") as start:
+        with patch("alerts.sys.platform", "win32"), \
+                patch("alerts._powershell_exe", return_value=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"), \
+                patch("alerts.subprocess.run") as run, \
+                patch("alerts.register_notification_identity", side_effect=OSError("access denied")):
+            run.return_value = Mock(returncode=0,
+                                    stdout="SL_RESTART_NOTIFICATION_SENT", stderr="")
             self.alerts.show_notification("标题", "内容")
-            start.assert_not_called()
-        self.assertIn("注册 Windows 通知身份失败", messages[-1])
-
-    @unittest.skipUnless(sys.platform == "win32", "Windows shell shortcut")
-    def test_shortcut_targets_current_executable_and_valid_app_id(self):
-        import pythoncom
-        from win32com.propsys import pscon
-        with patch("pythoncom.CoInitialize"), patch("pythoncom.CoUninitialize"), \
-                patch("pythoncom.CoCreateInstance") as create, \
-                patch("win32com.shell.shell.SHGetFolderPath", return_value=self.tmp.name), \
-                patch("alerts.sys.frozen", True, create=True):
-            register_notification_shortcut()
-            link = create.return_value
-            link.SetPath.assert_called_once_with(os.path.abspath(sys.executable))
-            link.SetArguments.assert_called_once_with("")
-            property_key, value = link.QueryInterface.return_value.SetValue.call_args.args
-            self.assertEqual(property_key, pscon.PKEY_AppUserModel_ID)
-            self.assertEqual(value.GetValue(), NOTIFICATION_APP_ID)
-            link.QueryInterface.return_value.Save.assert_called_once_with(
-                os.path.join(self.tmp.name, "SL Restart Notifications.lnk"), True)
+            self.alerts.stop()
+            run.assert_called_once()                 # 注册失败只记日志，照样发通知
 
     def test_settings_cancel_does_not_save(self):
         with patch("sl_restart.Monitor.start"), patch("sl_restart.Tray.show"), \
@@ -239,8 +284,9 @@ class AlertTests(unittest.TestCase):
         self.widgets.extend([ui.counter, ui.toast])
         try:
             with patch.object(ui.alerts, "notify_restart") as notify:
-                ui._push_restart(["1服", "3服"])
-                notify.assert_called_once_with(["1服", "3服"], self.cfg)
+                ui._push_restart([("1服", "127.0.0.1:7777"), ("3服", "127.0.0.1:7779")])  # 本地差异：事件带地址
+                notify.assert_called_once_with(
+                    [("1服", "127.0.0.1:7777"), ("3服", "127.0.0.1:7779")], self.cfg)
             def finish(dlg):
                 self.widgets.append(dlg)
                 dlg.sound_enabled.setChecked(True)

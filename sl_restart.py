@@ -3,6 +3,7 @@
 
 托盘常驻、无控制台窗口；
 左上角常驻人数条，某台服人数 **>0 掉到 0** 时弹红色重启提示 10 秒。
+提示**可点击**：点一下直接 steam://connect 进「晚重启的那台服」。
 """
 
 import argparse
@@ -15,7 +16,8 @@ import autostart
 import config
 from about import AboutDialog
 from alert_dialog import AlertDialog
-from alerts import RestartAlerts
+from alerts import JOIN_URL_PREFIX, RestartAlerts
+import joiner
 from monitor import Monitor
 from overlay import Overlay
 from server_dialog import ServersDialog
@@ -54,17 +56,18 @@ class App:
         self.toast = Overlay(cfg["restart_pos"], cfg["restart_font"],
                              duration=cfg["restart_seconds"],
                              color=cfg["restart_color"], bold=True,
-                             alpha=cfg["alpha"])
-        self._toast_names = []          # 当前这条提示里已经并排显示的重启服名
+                             alpha=cfg["alpha"], clickable=True)
+        self._toast_items = []          # 当前这条提示里的 (服名, 地址)，最后一个 = 晚重启的
         self.tray = Tray(app)
         self._build_menu()
 
-        self.counter.set_text(self.monitor.snapshot["text"])
         self.counter.set_visible(True)
+        self._draw_counter(self.monitor.snapshot)
         self._position_toast(*cfg["counter_pos"])
         self.tray.tip("SL Restart · 启动中…")
         self.tray.show()
         self.tray.on_click(lambda: self._toggle_counter(not self.counter.isVisible()))
+        self.toast.on_click = self._join_latest
 
         self.monitor.start()
         self.timer = QTimer()
@@ -78,6 +81,9 @@ class App:
         t.add("counter", "显示人数条",
               lambda: self._toggle_counter(t.acts["counter"].isChecked()),
               checkable=True, checked=True)
+        t.add("timer", "显示回合时长",
+              lambda: self._toggle_timer(t.acts["timer"].isChecked()),
+              checkable=True, checked=bool(self.cfg.get("show_timer", True)))
         t.add("move_counter", "移动人数条", self._toggle_move_counter,
               checkable=True)
         t.add("pause", "暂停监控", lambda: self._toggle_pause())
@@ -95,6 +101,18 @@ class App:
         self.counter.set_visible(flag)
         self.tray.set_checked("counter", flag)
         self.tray.tip("SL Restart · " + self.monitor.snapshot["text"])
+
+    def _toggle_timer(self, flag):
+        """托盘菜单切「显示回合时长」，并记住选择。"""
+        self.cfg["show_timer"] = bool(flag)
+        self.tray.set_checked("timer", self.cfg["show_timer"])
+        self.monitor.set_show_timer(self.cfg["show_timer"])
+        self._draw_counter(self.monitor.snapshot)          # 立刻重画，不用等下一轮
+        try:
+            config.save(self.cfg)
+        except Exception as e:
+            config.log("[ui] 保存 settings.json 失败：%r" % e)
+        config.log("[ui] 显示回合时长=%s" % self.cfg["show_timer"])
 
     def _toggle_pause(self):
         paused = not self.monitor.paused
@@ -119,6 +137,7 @@ class App:
             config.log("[ui] 保存人数条位置失败：%r" % e)
 
     def _position_toast(self, x, y):
+        """重启提示始终跟在人数条正下方（间距 >= 38px），不独立摆放。"""
         gap = max(38, self.counter.height() + 8)
         self.toast.set_position((x, y + gap))
 
@@ -157,7 +176,7 @@ class App:
         except Exception as e:
             config.log("[ui] 保存 settings.json 失败：%r" % e)
         self.monitor.set_servers(servers)
-        self.counter.set_text(self.monitor.snapshot["text"], ensure_shown=False)
+        self._draw_counter(self.monitor.snapshot, ensure_shown=False)
         self._toggle_counter(True)
         config.log("[ui] 服务器清单已更新：%s" % [s["addr"] for s in servers])
 
@@ -172,32 +191,73 @@ class App:
 
     # ------------------------------ 同步 ------------------------------
 
+    def _draw_counter(self, snap, ensure_shown=True):
+        """把快照画到人数条上：默认白字，回合时长超阈值那一段用黄色。"""
+        yellow = self.cfg.get("timer_color", "#FFD400")
+        segs = [(text, yellow if kind else None) for text, kind in snap.get("segments") or []]
+        self.counter.set_segments(segs, ensure_shown=ensure_shown)
+
     def _sync(self):
         snap = self.monitor.snapshot
-        self.counter.set_text(snap["text"], ensure_shown=False)   # 显隐由菜单/托盘左键决定
+        self._draw_counter(snap, ensure_shown=False)   # 显隐由菜单/托盘左键决定
         self.tray.tip("SL Restart · " + (snap["text"] or "…"))
-        names = self.monitor.take_restarts()
-        if names:
-            self._push_restart(names)
+        restarts = self.monitor.take_restarts()
+        if restarts:
+            self._push_restart(restarts)
 
-    def _push_restart(self, names):
+    def _push_restart(self, restarts):
         """重启提示：同一轮里几台服一起重启，就把服名并排显示成一条。
 
         不能一台一条 pop——后一条会盖掉前一条（信息丢失）。所以攒成：
         `[1服] [3服] 重启`；提示还在显示时又来一台，就并进去并把 10 秒倒计时重置。
+
+        整条提示**可点击**：点一下用 steam://connect 直连**晚重启**的那台
+        （事件顺序里的最后一个，最后重启 = 排队最靠前）；移动人数条期间不响应。
         """
         if not self.toast.isVisible():          # 上一条提示已经放完了，重新开始攒
-            self._toast_names = []
-        for n in names:
-            if n not in self._toast_names:
-                self._toast_names.append(n)
+            self._toast_items = []
+        for item in restarts:
+            if item not in self._toast_items:
+                self._toast_items.append(item)
         self._position_toast(self.counter.x(), self.counter.y())
-        self.toast.pop("%s 重启" % " ".join("[%s]" % n for n in self._toast_names))
-        self.alerts.notify_restart(names, self.cfg)
-        config.log("[ui] 弹重启提示：%s" % " ".join(names))
+        self.toast.pop("%s 重启" % " ".join("[%s]" % n for n, _a in self._toast_items))
+        self.alerts.notify_restart(restarts, self.cfg)
+        config.log("[ui] 弹重启提示：%s（点击将进 %s）"
+                   % (" ".join(n for n, _a in self._toast_items),
+                      "%s(%s)" % self._toast_items[-1]))
+
+    def _join_latest(self):
+        """点击重启提示 -> steam://connect 晚重启的那台服。成功不打扰，失败才提醒。"""
+        if not self._toast_items or self.counter._movable:
+            return                              # 没有可进的服；或正在拖人数条，拖动优先
+        name, addr = self._toast_items[-1]
+        ok, msg = joiner.join(addr)
+        if not ok:
+            self.tray.icon.showMessage("SL Restart", "加入 %s 失败：%s" % (name, msg),
+                                       QSystemTrayIcon.MessageIcon.Warning, 5000)
+        config.log("[ui] 点击重启提示进服 %s(%s)：ok=%s %s" % (name, addr, ok, msg))
+
+
+def _handle_join_url(url):
+    """Windows 通知按钮的协议回调：第二个实例只做一件事——steam 直连，然后退出。
+
+    不碰 Qt、不抢单实例锁，主程序照常在托盘里跑。
+    """
+    addr = url[len(JOIN_URL_PREFIX):].strip("/")
+    if config.parse_addr(addr):
+        ok, msg = joiner.join(addr)
+        config.log("[app] 通知按钮进服 %s：ok=%s %s" % (addr, ok, msg))
+    else:
+        config.log("[app] 通知按钮传来无效地址：%r" % url)
+    return 0
 
 
 def main(argv=None):
+    args_list = list(sys.argv[1:] if argv is None else argv)
+    for arg in args_list:                    # 通知按钮「进服」走这里，发完即退
+        if str(arg).startswith(JOIN_URL_PREFIX):
+            return _handle_join_url(str(arg))
+
     ap = argparse.ArgumentParser(prog="SL Restart", description="SCP:SL 服务器重启提示")
     ap.add_argument("--smoke", type=float, default=0,
                     help="开发用：跑 N 秒后自动退出（验证用）")
@@ -205,6 +265,8 @@ def main(argv=None):
                     help="开发用：把关于窗口画成 PNG 后退出（验证打包后可用）")
     ap.add_argument("--alerts-grab", metavar="PNG", default="",
                     help="开发用：把提醒设置画成 PNG 后退出（不播放声音或发送通知）")
+    ap.add_argument("--instance", default="SL_Restart_instance",
+                    help="开发用：单实例锁的名字（并行测试时不撞车）")
     args = ap.parse_args(argv)
 
     cfg = config.load()
@@ -225,13 +287,13 @@ def main(argv=None):
         QMessageBox.critical(None, "SL Restart", "系统托盘不可用，程序无法常驻。")
         return 2
 
-    guard = single_instance()
+    guard = single_instance(args.instance)
     if guard is None:
         config.log("[app] 已有实例在运行，本次启动退出")
         return 0
 
     ui = App(cfg, app)
-    config.log("[app] 启动：%s" % [s["addr"] for s in cfg["servers"]])
+    config.log("[app] 启动 v%s：%s" % (config.VERSION, [s["addr"] for s in cfg["servers"]]))
     if args.smoke:
         QTimer.singleShot(int(args.smoke * 1000), ui.quit)
     try:

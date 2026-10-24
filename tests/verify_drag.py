@@ -57,7 +57,7 @@ class DragTests(unittest.TestCase):
         self.assertTrue(counter.windowFlags() & transparent)
         self.ui.tray.acts["move_counter"].trigger()
         self.assertFalse(counter.windowFlags() & transparent)
-        self.assertTrue(self.ui.toast.windowFlags() & transparent)
+        self.assertFalse(self.ui.toast.windowFlags() & transparent)  # 本地差异：提示可点击，不穿透
         start = counter.pos()
         local = QPoint(8, 8)
         QTest.mousePress(counter, Qt.MouseButton.LeftButton, pos=local)
@@ -93,7 +93,7 @@ class DragTests(unittest.TestCase):
         self.ui._save_counter_position(320, 180)
         self.ui.toast.hide()
         self.ui.counter.set_position((320, 180))
-        self.ui._push_restart(["1服"])
+        self.ui._push_restart([("1服", "127.0.0.1:7777")])  # 本地差异：事件带地址
         self.assertEqual(self.ui.toast.pos(), QPoint(320, 218))
         cfg = config.load()
         cfg["counter_pos"] = [400, 250]

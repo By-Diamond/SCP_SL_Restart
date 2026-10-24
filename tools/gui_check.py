@@ -13,10 +13,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QPA_FONTDIR", r"C:\Windows\Fonts")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from PySide6.QtCore import Qt                            # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox     # noqa: E402
 
 import autostart                                          # noqa: E402
 import config                                             # noqa: E402
+import joiner                                             # noqa: E402
 import overlay as overlay_mod                             # noqa: E402
 import sl_restart                                         # noqa: E402
 from about import LINKS, AboutDialog                      # noqa: E402
@@ -52,13 +54,18 @@ def main():
     pump(app, 0.5)
     t = ui.tray
 
-    check("托盘菜单九项齐全",
-          set(t.acts) == {"counter", "move_counter", "pause", "refresh", "servers", "alerts", "autostart", "about", "quit"},
+    keys = ("counter", "timer", "move_counter", "pause", "refresh",
+            "servers", "alerts", "autostart", "about", "quit")
+    check("托盘菜单十项齐全",
+          set(t.acts) == set(keys),
           sorted(t.acts))
-    check("菜单文案：显示人数条 / 暂停监控 / 立即刷新 / 编辑服务器清单… / 开机自启 / 关于 / 退出程序",
-          [t.acts[k].text() for k in ("counter", "pause", "refresh", "servers", "autostart", "about", "quit")]
-          == ["显示人数条", "暂停监控", "立即刷新", "编辑服务器清单…", "开机自启", "关于", "退出程序"],
-          [t.acts[k].text() for k in ("counter", "pause", "refresh", "servers", "autostart", "about", "quit")])
+    check("菜单文案：显示人数条 / 显示回合时长 / 移动人数条 / 暂停监控 / 立即刷新 / "
+          "编辑服务器清单… / 提醒设置… / 开机自启 / 关于 / 退出程序",
+          [t.acts[k].text() for k in keys]
+          == ["显示人数条", "显示回合时长", "移动人数条", "暂停监控", "立即刷新",
+              "编辑服务器清单…", "提醒设置…", "开机自启", "关于", "退出程序"],
+          [t.acts[k].text() for k in keys])
+    check("「显示回合时长」默认勾选（默认全开）", t.acts["timer"].isChecked())
     check("人数条默认显示、重启提示默认不显示",
           ui.counter.isVisible() and not ui.toast.isVisible())
 
@@ -131,8 +138,39 @@ def main():
     check("宽度不变、只换数字时也会重绘（旧版这里 0 次重绘）",
           w == w2 and n1 > n0, "宽度 %s->%s，update 次数 %s->%s" % (w, w2, n0, n1))
 
+    # ---- 回合时长：显示格式 / 超 20 分钟变黄 / 菜单开关 ----
+    ui.monitor.set_paused(True)
+    pump(app, 0.4)                                    # 等在飞的那一轮跑完
+    ui.monitor._servers = [{"addr": "1.1.1.1:7777", "name": "1服", "timer": True},
+                           {"addr": "2.2.2.2:7779", "name": "3服", "timer": True}]
+    ui.monitor._players = {"1.1.1.1:7777": 40, "2.2.2.2:7779": 2}
+    ui.monitor._timer = {"1.1.1.1:7777": 1260.0, "2.2.2.2:7779": 120.0}
+    ui.monitor._show_timer = True
+    ui.monitor.snapshot = ui.monitor._make_snapshot()
+    ui._draw_counter(ui.monitor.snapshot)
+    check("人数条上带回合时长（M:SS），跟在人数后面",
+          ui.counter.text == "[1服] 40人 21:00  |  [3服] 2人 2:00", ui.counter.text)
+    cols = [c.name() if c else None for _, c in ui.counter.lines[0]]
+    check("超过 20 分钟的时长变黄、没超的保持白色",
+          cols.count("#ffd400") == 1 and cols.count(None) >= 3, cols)
+
+    t.acts["timer"].trigger()                          # 关掉总开关
+    pump(app, 0.2)
+    ui._draw_counter(ui.monitor.snapshot)
+    check("关掉「显示回合时长」后立刻不带时长",
+          ui.counter.text == "[1服] 40人  |  [3服] 2人", ui.counter.text)
+    body = open(config.path("settings.json"), encoding="utf-8").read()
+    check("开关状态写进了 settings.json", '"show_timer": false' in body, body[:160])
+    t.acts["timer"].trigger()                          # 再打开
+    pump(app, 0.2)
+    ui._draw_counter(ui.monitor.snapshot)
+    check("重新打开后时长回来", "21:00" in ui.counter.text, ui.counter.text)
+
+    ui.monitor.set_paused(False)
+    ui.monitor.set_servers(cfg["servers"])              # 换回真实清单，后面的用例继续用
+
     with ui.monitor._lock:
-        ui.monitor._pending.append("3服")
+        ui.monitor._pending.append(("3服", "127.0.0.1:7779"))
     ui._sync()
     pump(app, 0.2)
     check("重启事件 -> 弹窗显示「[3服] 重启」",
@@ -150,16 +188,44 @@ def main():
     ui.toast.set_visible(False)
     ui.toast._timer.stop()
     with ui.monitor._lock:
-        ui.monitor._pending.extend(["1服", "3服"])
+        ui.monitor._pending.extend([("1服", "127.0.0.1:7777"), ("3服", "127.0.0.1:7779")])
     ui._sync()
     pump(app, 0.2)
     check("同一轮两台服重启 -> 并排显示「[1服] [3服] 重启」",
           ui.toast.isVisible() and ui.toast.text == "[1服] [3服] 重启", ui.toast.text)
 
+    # ---- 点击重启提示 = steam://connect 晚重启的那台 ----
+    sent = []
+    old_join = joiner.join
+    joiner.join = lambda addr: sent.append(addr) or (True, "fake")
+    try:
+        ui.toast.on_click()
+    finally:
+        joiner.join = old_join
+    check("点击重启提示 -> 直连晚重启的那台（3服）",
+          sent == ["127.0.0.1:7779"], sent)
+
+    # ---- 移动人数条期间，点击提示不进服（拖动优先），解锁后恢复 ----
+    t.acts["move_counter"].trigger()
+    sent_move = []
+    joiner.join = lambda addr: sent_move.append(addr) or (True, "fake")
+    try:
+        ui.toast.on_click()
+    finally:
+        joiner.join = old_join
+    check("移动人数条期间点击提示不进服", sent_move == [], sent_move)
+    t.acts["move_counter"].trigger()
+    joiner.join = lambda addr: sent_move.append(addr) or (True, "fake")
+    try:
+        ui.toast.on_click()
+    finally:
+        joiner.join = old_join
+    check("解锁后点击恢复进服", sent_move == ["127.0.0.1:7779"], sent_move)
+
     pump(app, 1.5)                                    # 让倒计时先走掉一部分
     left_before = ui.toast._timer.remainingTime()
     with ui.monitor._lock:
-        ui.monitor._pending.append("5服")
+        ui.monitor._pending.append(("5服", "127.0.0.1:7781"))
     ui._sync()
     pump(app, 0.2)
     left_after = ui.toast._timer.remainingTime()
@@ -172,12 +238,12 @@ def main():
     # 提示放完之后，旧服名不许残留
     ui.toast.duration = 0.4
     with ui.monitor._lock:
-        ui.monitor._pending.append("3服")
+        ui.monitor._pending.append(("3服", "127.0.0.1:7779"))
     ui._sync()
     pump(app, 1.4)
     check("提示自动消失后旧服名被清掉", not ui.toast.isVisible())
     with ui.monitor._lock:
-        ui.monitor._pending.append("1服")
+        ui.monitor._pending.append(("1服", "127.0.0.1:7777"))
     ui._sync()
     pump(app, 0.2)
     check("下一次重启只显示本次的服名「[1服] 重启」",
@@ -228,7 +294,12 @@ def main():
     QMessageBox.warning = staticmethod(lambda *a, **k: None)
     try:
         dlg = ServersDialog(cfg["servers"])
-        check("编辑对话框读出 3 台服", dlg.table.rowCount() == 3)
+        check("编辑对话框读出 3 台服（地址 / 服名 / 显示时长 三列）",
+              dlg.table.rowCount() == 3 and dlg.table.columnCount() == 3
+              and dlg.table.horizontalHeaderItem(2).text() == "显示时长")
+        check("「显示时长」默认全部勾选",
+              all(dlg.table.item(r, 2).checkState() == Qt.CheckState.Checked for r in range(3)))
+        dlg.table.item(0, 2).setCheckState(Qt.CheckState.Unchecked)      # 第一台不显示时长
         dlg._add_row("banana", "坏服")
         dlg.accept()
         check("填错地址不放行（对话框不关闭）", dlg.result() == 0, dlg.result())
@@ -237,7 +308,10 @@ def main():
         dlg.accept()
         got = dlg.result_servers()
         check("改对后放行，解析出 4 台（含新加的 7服）",
-              dlg.result() == 1 and got[-1] == {"addr": "180.188.21.179:7783", "name": "7服"}, got)
+              dlg.result() == 1
+              and got[-1] == {"addr": "180.188.21.179:7783", "name": "7服", "timer": True}, got)
+        check("取消勾选的那台被记住（其余保持勾选）",
+              got[0]["timer"] is False and all(g["timer"] for g in got[1:]), got)
 
         dup = ServersDialog([{"addr": "1.1.1.1:7777", "name": "a"},
                              {"addr": "1.1.1.1:7777", "name": "b"}])
