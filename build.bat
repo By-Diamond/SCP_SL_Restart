@@ -2,47 +2,124 @@
 setlocal
 cd /d "%~dp0"
 
+REM ============================================================
+REM  SL Restart Ò»¼ü´ò°ü
+REM    build.bat            ±àÒë£¨±àÍêÍ£Ò»ÏÂ¿´½á¹û£©
+REM    build.bat notest     ²»ÅÜ×Ô¼ì£¬Ö±½Ó±àÒë
+REM    build.bat nopause    ±àÒëÍê²»Í££¨¸ø run.bat ÓÃ£©
+REM ============================================================
+
+set "NOPAUSE="
+set "SKIPTEST="
+echo %* | findstr /i /c:"nopause" >nul && set "NOPAUSE=1"
+echo %* | findstr /i /c:"notest" >nul && set "SKIPTEST=1"
+
 echo ==================================================
-echo  SL Restart - onefile build (PyInstaller)
+echo   SL Restart  Ò»¼ü´ò°ü
 echo ==================================================
 echo.
 
-where python >nul 2>nul
+REM ---------- 1/6 ÕÒ Python ----------
+set "PY="
+python -c "import sys" >nul 2>&1
+if not errorlevel 1 set "PY=python"
+if not defined PY (
+  py -3 -c "import sys" >nul 2>&1
+  if not errorlevel 1 set "PY=py -3"
+)
+if not defined PY (
+  echo [X] Ã»ÕÒµ½ Python¡£
+  echo     ÇëÏÈ°²×° Python 3.9+£¬°²×°Ê±¹´Ñ¡ "Add python.exe to PATH"¡£
+  goto fail
+)
+for /f "delims=" %%v in ('%PY% -c "import sys;print(sys.version.split()[0])"') do set "PYVER=%%v"
+echo [1/6] Python %PYVER%   ^(%PY%^)
+
+REM ---------- 2/6 ÒÀÀµ ----------
+%PY% -c "import PySide6, PyInstaller" >nul 2>&1
 if errorlevel 1 (
-  echo [X] python not found in PATH. Install Python 3.9+ first.
-  goto :fail
+  echo [2/6] È±ÒÀÀµ£¬ÕıÔÚ°²×° requirements-build.txt ...
+  %PY% -m pip install -r requirements-build.txt
+  if errorlevel 1 goto fail
+) else (
+  echo [2/6] ÒÀÀµÒÑ¾ÍĞ÷ ^(PySide6 / PyInstaller^)
 )
 
-echo [1/4] Installing build dependencies ...
-python -m pip install -r requirements-build.txt
-if errorlevel 1 goto :fail
+REM ---------- 3/6 ×Ô¼ì ----------
+if defined SKIPTEST (
+  echo [3/6] Ìø¹ı×Ô¼ì
+) else (
+  if exist "tests\verify_logic.py" (
+    echo [3/6] ÅÜ´¿Âß¼­×Ô¼ì ...
+    %PY% "tests\verify_logic.py"
+    if errorlevel 1 (
+      echo.
+      echo [X] ×Ô¼ìÃ»¹ı£¬²»´ò°ü¡£È·ÈÏ¿ÉÒÔÌø¹ıÊ±ÓÃ£ºbuild.bat notest
+      goto fail
+    )
+  ) else (
+    echo [3/6] Ã»ÓĞ tests\verify_logic.py£¬Ìø¹ı×Ô¼ì
+  )
+)
 
-echo.
-echo [2/4] Generating app icon ...
-python tools\make_icon.py
-if errorlevel 1 goto :fail
+REM ---------- 4/6 Í¼±ê ----------
+echo [4/6] Éú³ÉÍ¼±ê ...
+%PY% "tools\make_icon.py" >nul 2>&1
+if errorlevel 1 (
+  if exist "assets\app.ico" (
+    echo       Éú³ÉÊ§°Ü ^(¶à°ëÃ»×° Pillow^)£¬ÑØÓÃÏÖÓĞ assets\app.ico
+  ) else (
+    echo [X] ¼ÈÉú³É²»ÁËÍ¼±ê¡¢Ò²Ã»ÓĞ assets\app.ico£¬Ã»·¨´ò°ü
+    goto fail
+  )
+)
 
-echo.
-echo [3/4] Building single-file exe (this takes a while) ...
-python -m PyInstaller --noconfirm --clean --onefile --windowed ^
-  --name "SL Restart" ^
-  --icon assets\app.ico ^
-  --version-file tools\version_info.txt ^
-  sl_restart.py
-if errorlevel 1 goto :fail
+REM ---------- 5/6 ´ò°ü ----------
+echo [5/6] ´ò°üÖĞ£¬µÚÒ»´Î´óÔ¼ 1 ·ÖÖÓ ...
+%PY% -m PyInstaller --noconfirm --clean --onefile --windowed ^
+  --name SL_Restart_build ^
+  --icon "assets\app.ico" ^
+  --version-file "tools\version_info.txt" ^
+  --workpath build --distpath dist ^
+  "sl_restart.py"
+if errorlevel 1 goto fail
+if exist "SL_Restart_build.spec" del /q "SL_Restart_build.spec"
 
+REM ---------- 6/6 ¾ÍÎ» ----------
+set "NEWEXE=dist\SL_Restart_build.exe"
+set "OUTEXE=dist\SL Restart.exe"
+if not exist "%NEWEXE%" (
+  echo [X] Ã»Éú³É %NEWEXE%
+  goto fail
+)
+
+move /y "%NEWEXE%" "%OUTEXE%" >nul 2>&1
+if errorlevel 1 (
+  echo       ¾É°æ exe ÕıÔÚÔËĞĞ£¬ÏÈ¸ÄÃûÈÃÎ» ^(¾É°æÕÕ³£ÅÜ£¬ÍË³öºó¾Í²»ÔÙÓÃÁË^)
+  del /q "dist\¾É°æ_*_¿ÉÉ¾.exe" >nul 2>&1
+  move /y "%OUTEXE%" "dist\¾É°æ_%RANDOM%_¿ÉÉ¾.exe" >nul 2>&1
+  move /y "%NEWEXE%" "%OUTEXE%" >nul 2>&1
+)
+if not exist "%OUTEXE%" (
+  echo [X] Ìæ»» dist\SL Restart.exe Ê§°Ü£¬¿ÉÄÜ»¹±»Õ¼ÓÃ
+  goto fail
+)
+
+for %%F in ("%OUTEXE%") do set "SIZE=%%~zF"
+for /f "delims=" %%v in ('%PY% -c "import config;print(config.VERSION)"') do set "VER=%%v"
 echo.
-echo [4/4] Done.
+echo   ==================================================
+echo    ´ò°üÍê³É   v%VER%
+echo    ²úÎï£º%CD%\%OUTEXE%
+echo    ´óĞ¡£º%SIZE% ×Ö½Ú
+echo   ==================================================
 echo.
-echo   Output : dist\SL Restart.exe
-echo   settings.json / history.csv / latest.md / events.log éƒ½ç”Ÿæˆåœ¨ exe åŒç›®å½•ã€‚
-echo   è¿è¡Œåçœ‹å³ä¸‹è§’æ‰˜ç›˜å›¾æ ‡ï¼ˆå·¦é”® = æ˜¾ç¤º/éšè—äººæ•°æ¡ï¼Œå³é”® = èœå•ï¼‰ã€‚
-echo.
-pause
+if not defined NOPAUSE pause
 exit /b 0
 
 :fail
 echo.
-echo [X] Build failed - scroll up for the error message.
-pause
+echo [X] ´ò°üÊ§°Ü ¡ª¡ª ÍùÉÏ·­¿´±¨´íĞÅÏ¢¡£
+echo.
+if not defined NOPAUSE pause
 exit /b 1

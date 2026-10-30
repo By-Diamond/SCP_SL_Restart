@@ -8,6 +8,7 @@
 import os
 import sys
 import time
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QPA_FONTDIR", r"C:\Windows\Fonts")
@@ -18,10 +19,12 @@ from PySide6.QtWidgets import QApplication, QMessageBox     # noqa: E402
 
 import autostart                                          # noqa: E402
 import config                                             # noqa: E402
+import grab_dialog as grab_dialog_mod                     # noqa: E402
 import joiner                                             # noqa: E402
 import overlay as overlay_mod                             # noqa: E402
 import sl_restart                                         # noqa: E402
 from about import LINKS, AboutDialog                      # noqa: E402
+from alert_dialog import AlertDialog                      # noqa: E402
 from server_dialog import ServersDialog                   # noqa: E402
 
 FAILS = []
@@ -49,25 +52,51 @@ def main():
                        "build_shots", "gui_check_data")     # 别把测试数据写进项目根目录
     os.makedirs(tmp, exist_ok=True)
     config.set_base_dir(tmp)
+    try:
+        os.remove(config.path("settings.json"))      # 每次从默认配置开始，测试可重复
+    except FileNotFoundError:
+        pass
     cfg = config.load()
     ui = sl_restart.App(cfg, app)
     pump(app, 0.5)
     t = ui.tray
 
-    keys = ("counter", "timer", "move_counter", "pause", "refresh",
-            "servers", "alerts", "autostart", "about", "quit")
-    check("托盘菜单十项齐全",
+    keys = ("counter", "timer", "move_counter", "pause", "refresh", "grab",
+            "servers", "alerts", "api", "autostart", "about", "quit")
+    check("托盘菜单十二项齐全",
           set(t.acts) == set(keys),
           sorted(t.acts))
-    check("菜单文案：显示人数条 / 显示回合时长 / 移动人数条 / 暂停监控 / 立即刷新 / "
-          "编辑服务器清单… / 提醒设置… / 开机自启 / 关于 / 退出程序",
+    check("菜单文案：显示人数条 / 显示回合时长 / 移动人数条 / 暂停监控 / 立即刷新 / 自动挤服 / "
+          "编辑服务器清单… / 提醒设置… / 第三方适配 / 开机自启 / 关于 / 退出程序",
           [t.acts[k].text() for k in keys]
-          == ["显示人数条", "显示回合时长", "移动人数条", "暂停监控", "立即刷新",
-              "编辑服务器清单…", "提醒设置…", "开机自启", "关于", "退出程序"],
+          == ["显示人数条", "显示回合时长", "移动人数条", "暂停监控", "立即刷新", "自动挤服",
+              "编辑服务器清单…", "提醒设置…", "第三方适配", "开机自启", "关于", "退出程序"],
           [t.acts[k].text() for k in keys])
     check("「显示回合时长」默认勾选（默认全开）", t.acts["timer"].isChecked())
+    check("「显示人数条」默认勾选（默认显示）", t.acts["counter"].isChecked())
+    check("「第三方适配」默认关闭（默认不起本地端口）",
+          not t.acts["api"].isChecked() and not ui.api.running)
     check("人数条默认显示、重启提示默认不显示",
           ui.counter.isVisible() and not ui.toast.isVisible())
+
+    # ---- 第三方适配：开 / 关都能立刻生效，并且记住选择 ----
+    import socket as socket_mod
+    _s = socket_mod.socket()
+    _s.bind(("127.0.0.1", 0))
+    ui.cfg["api_port"] = _s.getsockname()[1]
+    _s.close()
+    t.acts["api"].trigger()
+    pump(app, 0.3)
+    body = open(config.path("settings.json"), encoding="utf-8").read()
+    check("打开「第三方适配」：端口起来、菜单勾上、状态写进 settings.json",
+          ui.api.running and t.acts["api"].isChecked()
+          and '"third_party_api": true' in body, body[:200])
+    t.acts["api"].trigger()
+    pump(app, 0.3)
+    body = open(config.path("settings.json"), encoding="utf-8").read()
+    check("关闭「第三方适配」：端口停掉、菜单取消、状态写进 settings.json",
+          (not ui.api.running) and (not t.acts["api"].isChecked())
+          and '"third_party_api": false' in body, body[:200])
 
     ui.toast.pop("[3服] 重启")
     pump(app, 0.2)
@@ -110,6 +139,34 @@ def main():
         ui._sync()
         pump(app, 0.05)
     check("连跑 5 次心跳也不会把隐藏的人数条弹回来", not ui.counter.isVisible())
+
+    # 回归：服务器重启弹提示时，不许把用户关掉的人数条弹回来
+    ui.toast.set_visible(False)
+    with ui.monitor._lock:
+        ui.monitor._pending.append(("3服", "127.0.0.1:7779"))
+    ui._sync()
+    pump(app, 0.2)
+    check("重启提示弹出时人数条仍然隐藏（提示自己正常显示）",
+          ui.toast.isVisible() and not ui.counter.isVisible(),
+          "人数条=%s 提示=%s" % (ui.counter.isVisible(), ui.toast.isVisible()))
+    ui.toast.set_visible(False)
+    ui.toast._timer.stop()
+
+    # 回归：编辑服务器清单（保存后重画）也不许硬把人数条打开
+    real_exec_srv = ServersDialog.exec
+    ServersDialog.exec = lambda self: ServersDialog.DialogCode.Accepted
+    try:
+        t.acts["servers"].trigger()
+        pump(app, 0.2)
+    finally:
+        ServersDialog.exec = real_exec_srv
+    check("保存服务器清单后人数条仍然隐藏", not ui.counter.isVisible())
+    body = open(config.path("settings.json"), encoding="utf-8").read()
+    check("「显示人数条」关掉的状态写进了 settings.json",
+          '"show_counter": false' in body, body[:200])
+    check("重新读配置：人数条是关的（下次启动不会自己冒出来）",
+          config.load()["show_counter"] is False)
+
     t.acts["counter"].trigger()
     pump(app, 0.2)
     check("重新勾选 -> 人数条回来", ui.counter.isVisible())
@@ -145,6 +202,7 @@ def main():
                            {"addr": "2.2.2.2:7779", "name": "3服", "timer": True}]
     ui.monitor._players = {"1.1.1.1:7777": 40, "2.2.2.2:7779": 2}
     ui.monitor._timer = {"1.1.1.1:7777": 1260.0, "2.2.2.2:7779": 120.0}
+    ui.monitor._round_phase = {"1.1.1.1:7777": "running", "2.2.2.2:7779": "running"}
     ui.monitor._show_timer = True
     ui.monitor.snapshot = ui.monitor._make_snapshot()
     ui._draw_counter(ui.monitor.snapshot)
@@ -222,6 +280,74 @@ def main():
         joiner.join = old_join
     check("解锁后点击恢复进服", sent_move == ["127.0.0.1:7779"], sent_move)
 
+    # ---- 自动挤服：配置对话框（预填 / 校验 / 结果） ----
+    main_servers = [{"addr": "180.188.21.179:7777", "name": "1服", "timer": True}]
+    saved = [{"addr": "180.188.21.179:7777", "name": "1服", "enabled": True, "threshold": 30},
+             {"addr": "127.0.0.1:9000", "name": "", "enabled": False, "threshold": None}]
+    gd = grab_dialog_mod.GrabDialog(saved, main_servers)
+    gd.show()
+    check("挤服对话框：清单服 + 自定义服都列出（行数/勾选/阈值）",
+          gd.table.rowCount() == 2
+          and gd.table.item(0, 0).checkState() == Qt.CheckState.Checked
+          and gd.table.item(0, 2).text() == "30"
+          and gd.table.item(1, 1).text() == "127.0.0.1:9000",
+          gd.table.rowCount())
+    got = gd.result_servers()
+    check("挤服对话框读出结果（地址规范化 / 阈值留空 = None）",
+          got == [{"addr": "180.188.21.179:7777", "name": "1服", "enabled": True,
+                   "threshold": 30},
+                  {"addr": "127.0.0.1:9000", "name": "", "enabled": False,
+                   "threshold": None}], got)
+
+    real_warning = QMessageBox.warning
+    QMessageBox.warning = staticmethod(lambda *a, **k: None)
+    try:
+        bad = grab_dialog_mod.GrabDialog([], main_servers)
+        bad._add_row("banana")
+        bad.accept()
+        check("挤服对话框：非法地址不放行", bad.result() == 0, bad.result())
+        bad.table.item(0, 1).setText("127.0.0.1:9000")
+        bad._add_row("127.0.0.1:9000")
+        bad.accept()
+        check("挤服对话框：重复地址不放行", bad.result() == 0, bad.result())
+        bad.table.removeRow(1)
+        bad.table.item(0, 2).setText("5000")
+        bad.accept()
+        check("挤服对话框：阈值超范围不放行", bad.result() == 0, bad.result())
+    finally:
+        QMessageBox.warning = real_warning
+
+    # ---- 自动挤服：托盘开关 + 命中（进服 + Toast + 自动取消勾选） ----
+    def accept_grab(dlg):
+        dlg.table.item(0, 0).setCheckState(Qt.CheckState.Checked)
+        return grab_dialog_mod.GrabDialog.DialogCode.Accepted
+
+    with patch.object(grab_dialog_mod.GrabDialog, "exec", accept_grab), \
+            patch.object(ui.monitor, "set_grab") as set_grab:
+        ui.tray.acts["grab"].trigger()          # trigger() 自己会翻转勾选 -> 打开
+        set_grab.assert_called_once()
+        check("自动挤服开启：菜单保持勾选、监控已配置", ui.tray.acts["grab"].isChecked())
+    ui.tray.acts["grab"].trigger()              # 再点一次 -> 关闭（不会弹对话框）
+    check("自动挤服关闭：菜单取消勾选", not ui.tray.acts["grab"].isChecked())
+
+    ui.monitor._grab_pending.append({"addr": "180.188.21.179:7779", "name": "3服",
+                                     "players": 0, "max": 45, "threshold": 45})
+    sent_hit = []
+    old_join = joiner.join
+    joiner.join = lambda addr: sent_hit.append(addr) or (True, "fake")
+    notified = []
+    with patch.object(ui.alerts, "show_notification",
+                      lambda *a, **k: notified.append(a)):
+        try:
+            ui._sync()
+            pump(app, 0.2)
+        finally:
+            joiner.join = old_join
+    check("挤服命中 -> 直连那一台 + 弹 Toast + 菜单自动取消勾选",
+          sent_hit == ["180.188.21.179:7779"] and notified
+          and not ui.tray.acts["grab"].isChecked(),
+          (sent_hit, bool(notified), ui.tray.acts["grab"].isChecked()))
+
     pump(app, 1.5)                                    # 让倒计时先走掉一部分
     left_before = ui.toast._timer.remainingTime()
     with ui.monitor._lock:
@@ -251,6 +377,30 @@ def main():
     ui.toast.duration = cfg["restart_seconds"]
     ui.toast.set_visible(False)
     ui.toast._timer.stop()
+
+    # ---- 提醒设置：提示框开关 + 开局估算参数 ----
+    adlg = AlertDialog(ui.cfg, ui.alerts)
+    check("提醒设置：默认启用重启提示框", adlg.toast_enabled.isChecked())
+    check("提醒设置：开局估算默认 2 人 / 45 秒",
+          (adlg.round_min_players.value(), adlg.round_start_delay.value()) == (2, 45),
+          "%s / %s" % (adlg.round_min_players.value(), adlg.round_start_delay.value()))
+    adlg.round_min_players.setValue(3)
+    adlg.round_start_delay.setValue(10)
+    adlg.toast_enabled.setChecked(False)
+    st = adlg.result_settings()
+    check("提醒设置：结果带回提示框与估算参数",
+          st["show_toast"] is False and st["round_min_players"] == 3
+          and st["round_start_delay"] == 10, st)
+    adlg.deleteLater()
+
+    ui.cfg["show_toast"] = False                       # 关掉提示框：重启只走日志/通知
+    ui.toast.set_visible(False)
+    with ui.monitor._lock:
+        ui.monitor._pending.append(("1服", "127.0.0.1:7777"))
+    ui._sync()
+    pump(app, 0.3)
+    check("关掉「启用重启提示框」后不再弹提示", not ui.toast.isVisible())
+    ui.cfg["show_toast"] = True
 
     ui.monitor.set_servers([{"addr": "127.0.0.1:1", "name": "测试服"}])
     pump(app, 0.5)
@@ -320,10 +470,25 @@ def main():
     finally:
         QMessageBox.warning = real_warning
 
-    ui.monitor.stop()
+    # ---- 启动时按保存值来：上次关掉人数条，这次启动就不显示 ----
+    cfg_off = config.load()
+    cfg_off["show_counter"] = False
+    ui2 = sl_restart.App(cfg_off, app)
+    pump(app, 0.3)
+    check("启动时按「显示人数条」的保存值来（保存为关 -> 启动就不显示）",
+          (not ui2.counter.isVisible()) and (not ui2.tray.acts["counter"].isChecked()))
+    ui2.monitor.stop()
+    ui2.counter.hide()
+    ui2.toast.hide()
+
+    t0 = time.time()
+    ui.quit()
+    quit_dt = time.time() - t0
+    check("退出（停监控 + 关端口 + 清理）在 1.5 秒内完成", quit_dt < 1.5, "%.2fs" % quit_dt)
     pump(app, 0.2)
     print("\n%s" % ("全部通过" if not FAILS else "失败 %d 项：%s" % (len(FAILS), FAILS)))
-    return 1 if FAILS else 0
+    sys.stdout.flush()
+    os._exit(1 if FAILS else 0)          # 不跑 Qt 收尾：离屏窗口太多，退出码会乱
 
 
 if __name__ == "__main__":

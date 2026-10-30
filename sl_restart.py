@@ -7,7 +7,10 @@
 """
 
 import argparse
+import os
 import sys
+import threading
+import time
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
@@ -17,10 +20,13 @@ import config
 from about import AboutDialog
 from alert_dialog import AlertDialog
 from alerts import JOIN_URL_PREFIX, RestartAlerts
+from api_server import ApiServer
 import joiner
 from monitor import Monitor
 from overlay import Overlay
+from grab_dialog import GrabDialog
 from server_dialog import ServersDialog
+from tray import Tray
 from tray import Tray
 
 SYNC_MS = 200
@@ -53,6 +59,7 @@ class App:
                                alpha=cfg["alpha"])
         self.counter.position_changed.connect(self._save_counter_position)
         self.counter.position_moved.connect(self._position_toast)
+        self._counter_on = bool(cfg.get("show_counter", True))   # 人数条显隐，上次的选择
         self.toast = Overlay(cfg["restart_pos"], cfg["restart_font"],
                              duration=cfg["restart_seconds"],
                              color=cfg["restart_color"], bold=True,
@@ -61,8 +68,8 @@ class App:
         self.tray = Tray(app)
         self._build_menu()
 
-        self.counter.set_visible(True)
-        self._draw_counter(self.monitor.snapshot)
+        self.counter.set_visible(self._counter_on)
+        self._draw_counter(self.monitor.snapshot, ensure_shown=False)
         self._position_toast(*cfg["counter_pos"])
         self.tray.tip("SL Restart · 启动中…")
         self.tray.show()
@@ -70,6 +77,9 @@ class App:
         self.toast.on_click = self._join_latest
 
         self.monitor.start()
+        self.api = ApiServer(self.monitor, lambda: self.cfg)
+        if self.cfg.get("third_party_api"):
+            self.api.start(int(self.cfg.get("api_port") or 17777))
         self.timer = QTimer()
         self.timer.timeout.connect(self._sync)
         self.timer.start(SYNC_MS)
@@ -80,7 +90,7 @@ class App:
         t = self.tray
         t.add("counter", "显示人数条",
               lambda: self._toggle_counter(t.acts["counter"].isChecked()),
-              checkable=True, checked=True)
+              checkable=True, checked=self._counter_on)
         t.add("timer", "显示回合时长",
               lambda: self._toggle_timer(t.acts["timer"].isChecked()),
               checkable=True, checked=bool(self.cfg.get("show_timer", True)))
@@ -88,9 +98,12 @@ class App:
               checkable=True)
         t.add("pause", "暂停监控", lambda: self._toggle_pause())
         t.add("refresh", "立即刷新", self.monitor.refresh_now)
+        t.add("grab", "自动挤服", self._toggle_grab, checkable=True)
         t.sep()
         t.add("servers", "编辑服务器清单…", self._edit_servers)
         t.add("alerts", "提醒设置…", self._edit_alerts)
+        t.add("api", "第三方适配", self._toggle_api,
+              checkable=True, checked=bool(self.cfg.get("third_party_api")))
         t.add("autostart", "开机自启", self._toggle_autostart,
               checkable=True, checked=autostart.is_enabled())
         t.sep()
@@ -98,16 +111,25 @@ class App:
         t.add("quit", "退出程序", self.quit)
 
     def _toggle_counter(self, flag):
+        """托盘菜单 / 左键切人数条，并记住选择（下次启动按这个状态来）。"""
+        flag = bool(flag)
+        self._counter_on = flag
         self.counter.set_visible(flag)
         self.tray.set_checked("counter", flag)
         self.tray.tip("SL Restart · " + self.monitor.snapshot["text"])
+        self.cfg["show_counter"] = flag
+        try:
+            config.save(self.cfg)
+        except Exception as e:
+            config.log("[ui] 保存 settings.json 失败：%r" % e)
+        config.log("[ui] 显示人数条=%s" % flag)
 
     def _toggle_timer(self, flag):
         """托盘菜单切「显示回合时长」，并记住选择。"""
         self.cfg["show_timer"] = bool(flag)
         self.tray.set_checked("timer", self.cfg["show_timer"])
         self.monitor.set_show_timer(self.cfg["show_timer"])
-        self._draw_counter(self.monitor.snapshot)          # 立刻重画，不用等下一轮
+        self._draw_counter(self.monitor.snapshot, ensure_shown=False)   # 立刻重画，不用等下一轮
         try:
             config.save(self.cfg)
         except Exception as e:
@@ -127,6 +149,49 @@ class App:
         if movable:
             self._toggle_counter(True)
 
+    def _toggle_grab(self):
+        """自动挤服：勾上弹配置框，确认后开启；取消勾选立即停止。
+
+        命中一次（进服 + Toast）后监控端自动关闭，菜单勾选由 _sync 同步回去。
+        """
+        checked = self.tray.acts["grab"].isChecked()
+        if not checked:
+            self.monitor.set_grab([], False)
+            self.tray.tip("SL Restart · 自动挤服已关闭")
+            config.log("[ui] 自动挤服已关闭")
+            return
+        dlg = GrabDialog(self.cfg.get("grab_servers"), self.cfg["servers"])
+        if dlg.exec() != GrabDialog.DialogCode.Accepted:
+            self.tray.set_checked("grab", False)
+            return
+        servers = dlg.result_servers()
+        enabled = [s for s in servers if s["enabled"]]
+        if not enabled:
+            QMessageBox.warning(None, "自动挤服", "至少要勾选一台要挤的服务器。")
+            self.tray.set_checked("grab", False)
+            return
+        self.cfg["grab_servers"] = servers
+        try:
+            config.save(self.cfg)
+        except Exception as e:
+            config.log("[ui] 保存 settings.json 失败：%r" % e)
+        self.monitor.set_grab(enabled, True)
+        self.tray.tip("SL Restart · 自动挤服监控中（%d 台）" % len(enabled))
+        config.log("[ui] 自动挤服已开启：%s"
+                   % ["%s%s" % (s["addr"], "（阈值%d）" % s["threshold"] if s["threshold"] else "")
+                      for s in enabled])
+
+    def _handle_grab_hit(self, hit):
+        """挤服命中：立即 steam 直连 + 弹 Windows Toast（无论通知开关是否打开）。"""
+        ok, msg = joiner.join(hit["addr"])
+        self.alerts.show_notification(
+            "自动挤服",
+            "[%s] 有空位：%d/%d（低于阈值 %s），已自动加入"
+            % (hit["name"], hit["players"], hit["max"], hit["threshold"]))
+        config.log("[ui] 自动挤服命中 %s(%s) %d/%d < %s：ok=%s %s"
+                   % (hit["name"], hit["addr"], hit["players"], hit["max"],
+                      hit["threshold"], ok, msg))
+
     def _save_counter_position(self, x, y):
         self.cfg["counter_pos"] = [x, y]
         self._position_toast(x, y)
@@ -145,16 +210,49 @@ class App:
         dlg = AlertDialog(self.cfg, self.alerts)
         if dlg.exec() != AlertDialog.DialogCode.Accepted:
             return
-        updated = dict(self.cfg, **dlg.result_settings())
+        settings = dlg.result_settings()
+        updated = dict(self.cfg, **settings)
+        timing_changed = any(updated.get(key) != self.cfg.get(key)
+                             for key in ("round_min_players", "round_start_delay"))
         try:
             config.save(updated)
         except Exception as e:
             config.log("[ui] 保存提醒设置失败：%r" % e)
             QMessageBox.warning(None, "保存失败", "提醒设置未保存，请检查程序目录是否可写。")
             return
-        self.cfg.update(dlg.result_settings())
+        self.cfg.update(settings)
+        if timing_changed:
+            self.monitor.reset_round_timers()               # 参数变了：重新观察，不沿用旧时长
+            self._draw_counter(self.monitor.snapshot, ensure_shown=False)
+        if not self.cfg.get("show_toast", True):            # 刚关掉：把还挂着的提示一起收掉
+            self._toast_items = []
+            self.toast.hide()
         if not self.cfg["sound_enabled"]:
             self.alerts.stop_sound()
+        config.log("[ui] 提醒设置：提示框=%s 开局门槛=%s 等待=%s秒"
+                   % (self.cfg.get("show_toast"), self.cfg.get("round_min_players"),
+                      self.cfg.get("round_start_delay")))
+
+    def _toggle_api(self):
+        """第三方适配：开关本地数据端口（只绑 127.0.0.1），供灵动岛等第三方程序读快照。"""
+        want = bool(self.tray.acts["api"].isChecked())
+        ok = False
+        if want:
+            ok = self.api.start(int(self.cfg.get("api_port") or 17777))
+        else:
+            self.api.stop()
+        self.cfg["third_party_api"] = bool(want and ok)
+        self.tray.set_checked("api", self.cfg["third_party_api"])
+        try:
+            config.save(self.cfg)
+        except Exception as e:
+            config.log("[ui] 保存 settings.json 失败：%r" % e)
+        self.tray.tip("SL Restart · " + (
+            "第三方适配已开启（127.0.0.1:%d）" % self.cfg["api_port"]
+            if self.cfg["third_party_api"]
+            else ("端口 %s 被占用，开启失败" % self.cfg["api_port"] if want
+                  else "第三方适配已关闭")))
+        config.log("[ui] 第三方适配=%s" % self.cfg["third_party_api"])
 
     def _toggle_autostart(self):
         want = self.tray.acts["autostart"].isChecked()
@@ -176,8 +274,7 @@ class App:
         except Exception as e:
             config.log("[ui] 保存 settings.json 失败：%r" % e)
         self.monitor.set_servers(servers)
-        self._draw_counter(self.monitor.snapshot, ensure_shown=False)
-        self._toggle_counter(True)
+        self._draw_counter(self.monitor.snapshot, ensure_shown=False)   # 显隐听菜单的，不硬弹回来
         config.log("[ui] 服务器清单已更新：%s" % [s["addr"] for s in servers])
 
     def _about(self):
@@ -185,9 +282,33 @@ class App:
         AboutDialog(self.tray.icon.icon()).exec()
 
     def quit(self):
+        """退出：每个环节都限时，绝不让「退出程序」卡在那里没反应。"""
+        if getattr(self, "_quitting", False):
+            return
+        self._quitting = True
+        t0 = time.time()
+        config.log("[ui] 请求退出")
+        try:
+            self.timer.stop()                       # 先停 200ms 心跳
+            self.tray.icon.hide()                   # 托盘图标立刻消失，不用等 Qt 收尾
+            self.counter.hide()
+            self.toast.hide()
+        except Exception as e:
+            config.log("[ui] 退出时隐藏界面失败（忽略）：%r" % e)
+        # 兜底：清理阶段万一被 Qt / 子进程拖住，最多 5 秒就强制结束进程
+        threading.Thread(target=self._force_exit_after, args=(5.0,),
+                         name="quit-watchdog", daemon=True).start()
         self.monitor.stop()
+        self.api.stop()
         self.alerts.stop()
+        config.log("[ui] 清理完成：%.2fs" % (time.time() - t0))
         self.app.quit()
+
+    @staticmethod
+    def _force_exit_after(secs):
+        time.sleep(secs)
+        config.log("[ui] 退出超时，强制结束进程")
+        os._exit(0)
 
     # ------------------------------ 同步 ------------------------------
 
@@ -204,6 +325,12 @@ class App:
         restarts = self.monitor.take_restarts()
         if restarts:
             self._push_restart(restarts)
+        hits = self.monitor.take_grab_hits()
+        if hits:
+            for hit in hits:
+                self._handle_grab_hit(hit)
+            self.tray.set_checked("grab", False)       # 挤到服自动关闭，菜单同步
+            self.tray.tip("SL Restart · 已自动挤进 %s" % hits[-1]["name"])
 
     def _push_restart(self, restarts):
         """重启提示：同一轮里几台服一起重启，就把服名并排显示成一条。
@@ -213,7 +340,16 @@ class App:
 
         整条提示**可点击**：点一下用 steam://connect 直连**晚重启**的那台
         （事件顺序里的最后一个，最后重启 = 排队最靠前）；移动人数条期间不响应。
+        「启用重启提示框」关掉时只记日志，不弹框（声音 / 系统通知照旧）。
         """
+        if not self.cfg.get("show_toast", True):
+            self._toast_items = []
+            if self.toast.isVisible():
+                self.toast.hide()
+            config.log("[ui] 重启提示框已关闭，跳过弹框：%s"
+                       % " ".join(n for n, _a in restarts))
+            self.alerts.notify_restart(restarts, self.cfg)
+            return
         if not self.toast.isVisible():          # 上一条提示已经放完了，重新开始攒
             self._toast_items = []
         for item in restarts:

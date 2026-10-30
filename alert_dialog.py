@@ -7,7 +7,7 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
                                QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-                               QPushButton, QSlider, QVBoxLayout)
+                               QPushButton, QSlider, QSpinBox, QVBoxLayout)
 
 from alerts import RestartAlerts
 
@@ -16,10 +16,13 @@ class AlertDialog(QDialog):
     def __init__(self, cfg, notifier=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("重启提醒设置")
-        self.resize(520, 320)
+        self.resize(520, 420)
         self._preview = RestartAlerts(self)
         self._notifier = notifier or self._preview
         self.finished.connect(lambda _result: self._preview.stop_sound())
+
+        self.toast_enabled = QCheckBox("启用重启提示框")
+        self.toast_enabled.setChecked(cfg.get("show_toast", True))
 
         self.sound_enabled = QCheckBox("启用重启提示音")
         self.sound_enabled.setChecked(cfg.get("sound_enabled", False))
@@ -64,6 +67,19 @@ class AlertDialog(QDialog):
 
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
+        self.round_min_players = QSpinBox()
+        self.round_min_players.setRange(1, 100)
+        self.round_min_players.setValue(cfg.get("round_min_players", 2))
+        self.round_start_delay = QSpinBox()
+        self.round_start_delay.setRange(0, 300)
+        self.round_start_delay.setSuffix(" 秒")
+        self.round_start_delay.setValue(cfg.get("round_start_delay", 45))
+        timing = QHBoxLayout()
+        timing.addWidget(QLabel("开局估算：至少"))
+        timing.addWidget(self.round_min_players)
+        timing.addWidget(QLabel("人，等待"))
+        timing.addWidget(self.round_start_delay)
+        timing.addStretch(1)
         self._preview.status.connect(self.status_label.setText)
         if self._notifier is not self._preview:
             self._notifier.status.connect(self.status_label.setText)
@@ -73,6 +89,7 @@ class AlertDialog(QDialog):
         box.rejected.connect(self.reject)
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("仅检测到服务器重启时提醒；同一批多服重启会合并提醒。"))
+        layout.addWidget(self.toast_enabled)
         layout.addWidget(self.sound_enabled)
         layout.addLayout(files)
         layout.addLayout(volume)
@@ -82,6 +99,11 @@ class AlertDialog(QDialog):
         hint.setWordWrap(True)
         layout.addWidget(hint)
         layout.addLayout(notifications)
+        layout.addLayout(timing)
+        timing_hint = QLabel("回合时长是本地估算：达到人数门槛先显示「开局」，倒计时结束才开始计时。\n"
+                             "改估算参数会重新计时；中途打开程序无法还原已进行的回合。")
+        timing_hint.setWordWrap(True)
+        layout.addWidget(timing_hint)
         layout.addWidget(self.status_label)
         layout.addStretch(1)
         layout.addWidget(box)
@@ -102,10 +124,13 @@ class AlertDialog(QDialog):
         self._notifier.show_notification("SL Restart · 测试通知", "服务器重启时会在此显示提醒。")
 
     def result_settings(self):
-        return {"sound_enabled": self.sound_enabled.isChecked(),
+        return {"show_toast": self.toast_enabled.isChecked(),
+                "sound_enabled": self.sound_enabled.isChecked(),
                 "sound_file": self.sound_file.text(),
                 "sound_volume": self.volume.value(),
-                "windows_notifications": self.notifications_enabled.isChecked()}
+                "windows_notifications": self.notifications_enabled.isChecked(),
+                "round_min_players": self.round_min_players.value(),
+                "round_start_delay": self.round_start_delay.value()}
 
     def accept(self):
         if self.sound_enabled.isChecked() and self.sound_file.text() \

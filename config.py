@@ -11,7 +11,7 @@ import os
 import sys
 from datetime import datetime
 
-VERSION = "0.3.0"               # 单一来源：关于窗口用它；tools/version_info.txt 需手工同步
+VERSION = "0.4.1"               # 单一来源：关于窗口用它；tools/version_info.txt 需手工同步
 
 DEFAULTS = {
     "servers": [
@@ -24,8 +24,12 @@ DEFAULTS = {
     "retries": 1,               # 抗丢包重试次数
     "offline_fails": 2,         # 连续失败几次才算「服务器下线」（防抖动误报重启）
     "show_timer": True,         # 回合时长计时器总开关（托盘菜单可切）
+    "show_counter": True,       # 人数条显隐（托盘菜单可切，记住上次选择）
+    "show_toast": True,         # 重启提示框（左上角红字）开关，在「提醒设置…」里改
     "timer_color": "#FFD400",   # 时长超阈值后的字色（黄）
     "timer_yellow_after": 1200,  # 时长多少秒后转黄（20 分钟）
+    "round_min_players": 2,     # 开局门槛：人数达到这么多才开始「开局」倒计时
+    "round_start_delay": 45,    # 开局倒计时秒数（倒计时完才从 0:00 起算回合时长）
     "counter_pos": [10, 10],    # 人数条位置
     "restart_pos": [10, 48],    # 重启提示位置（让开人数条）
     "counter_font": 16,         # 人数条字号
@@ -37,6 +41,9 @@ DEFAULTS = {
     "sound_file": "",           # 自定义音频绝对路径；留空使用系统提示音
     "sound_volume": 70,         # 提示音音量 0-100
     "windows_notifications": False,  # Windows 通知中心提醒（默认关闭）
+    "grab_servers": [],         # 自动挤服清单：[{"addr","name","enabled","threshold"}]
+    "third_party_api": False,   # 第三方适配：本地数据端口（托盘菜单可切）
+    "api_port": 17777,          # 数据端口（只绑 127.0.0.1）
 }
 
 _BASE = None                    # 测试时用 set_base_dir 改写到临时目录
@@ -109,8 +116,14 @@ def load():
         pass
     good = normalize_servers(cfg.get("servers"))
     cfg["servers"] = good or [dict(s) for s in DEFAULTS["servers"]]
-    for key in ("sound_enabled", "windows_notifications"):
+    for key in ("sound_enabled", "windows_notifications", "show_timer", "show_counter",
+                "show_toast", "third_party_api"):
         if not isinstance(cfg[key], bool):
+            cfg[key] = DEFAULTS[key]
+    for key, low, high in (("round_min_players", 1, 100), ("round_start_delay", 0, 300)):
+        try:
+            cfg[key] = max(low, min(high, int(cfg[key])))
+        except (TypeError, ValueError, OverflowError):
             cfg[key] = DEFAULTS[key]
     if not isinstance(cfg["sound_file"], str):
         cfg["sound_file"] = ""
@@ -118,6 +131,12 @@ def load():
         cfg["sound_volume"] = max(0, min(100, int(cfg["sound_volume"])))
     except (TypeError, ValueError, OverflowError):
         cfg["sound_volume"] = DEFAULTS["sound_volume"]
+    try:
+        cfg["api_port"] = int(cfg["api_port"])
+        if not 1 <= cfg["api_port"] <= 65535:
+            raise ValueError
+    except (TypeError, ValueError, OverflowError):
+        cfg["api_port"] = DEFAULTS["api_port"]
     return cfg
 
 

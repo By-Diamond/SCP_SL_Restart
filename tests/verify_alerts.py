@@ -254,8 +254,8 @@ class AlertTests(unittest.TestCase):
         self.assertFalse(self.cfg["windows_notifications"])
         dlg.accept()
         self.assertEqual(dlg.result_settings(), {
-            "sound_enabled": True, "sound_file": "", "sound_volume": 31,
-            "windows_notifications": True})
+            "show_toast": True, "sound_enabled": True, "sound_file": "", "sound_volume": 31,
+            "windows_notifications": True, "round_min_players": 2, "round_start_delay": 45})
 
     def test_dialog_browse_preview_and_notification_test(self):
         dlg = AlertDialog(self.cfg, self.alerts)

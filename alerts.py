@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import xml.etree.ElementTree as ET
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal
@@ -32,9 +33,55 @@ MAX_INFLIGHT_NOTIFICATIONS = 6
 JOIN_PROTOCOL = "slrestart"                  # 通知按钮的协议：slrestart://join/IP:端口
 JOIN_URL_PREFIX = JOIN_PROTOCOL + "://join/"
 
+ISLAND_ACTIVITY_URL = "http://127.0.0.1:47300/api/activities/"   # 灵动岛（NotchPeninsula）本地推送口
+ISLAND_PUSH_TIMEOUT_S = 0.8
+ISLAND_TOAST_SECONDS = 10                    # 卡片停留 10 秒（宿主 duration 允许 1..60）
+
 
 def join_url_for(addr):
     return JOIN_URL_PREFIX + addr
+
+
+def app_icon_path():
+    """程序图标：优先 assets/app.ico（宿主当普通图片读），没有就给 exe 自身（宿主抽 Shell 图标）。"""
+    ico = os.path.join(config.base_dir(), "assets", "app.ico")
+    if os.path.isfile(ico):
+        return ico
+    if getattr(sys, "frozen", False):
+        return os.path.abspath(sys.executable)
+    return ""
+
+
+def build_island_payload(title, message, join_url=""):
+    """灵动岛卡片：标题/正文与系统通知一致，额外带点击目标和「进服」按钮。
+
+    Windows 的通知监听 API 只暴露文本（读不到 <actions> 里的按钮），
+    所以带按钮的卡片必须由发送方自己把目标一并推给灵动岛。
+    """
+    payload = {"kind": "SL Restart", "title": title, "subtitle": message,
+               "duration": ISLAND_TOAST_SECONDS}
+    icon = app_icon_path()
+    if icon:
+        payload["icon"] = icon
+    if join_url:
+        payload["url"] = join_url
+        payload["buttons"] = [{"text": "进服", "uri": join_url}]
+    return payload
+
+
+def push_island(payload):
+    """POST 给灵动岛；没装/没开/端口被占都静默放弃——绝不阻塞，也绝不弹错。"""
+    try:
+        import json
+        import urllib.request
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(ISLAND_ACTIVITY_URL, data=data,
+                                         headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=ISLAND_PUSH_TIMEOUT_S) as response:
+            return response.status == 200
+    except Exception as e:
+        config.log("[alerts] 灵动岛推送跳过：%r" % e)
+        return False
 
 
 def default_sound_file():
@@ -126,11 +173,7 @@ def register_notification_identity():
     key = r"Software\Classes\AppUserModelId\%s" % NOTIFICATION_APP_ID
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key) as handle:
         winreg.SetValueEx(handle, "DisplayName", 0, winreg.REG_SZ, "SL Restart")
-        if getattr(sys, "frozen", False):
-            icon = os.path.abspath(sys.executable)
-        else:
-            path = os.path.join(config.base_dir(), "assets", "app.ico")
-            icon = path if os.path.isfile(path) else ""
+        icon = app_icon_path()
         if icon:
             winreg.SetValueEx(handle, "IconUri", 0, winreg.REG_SZ, icon)
     proto = r"Software\Classes\%s" % JOIN_PROTOCOL
@@ -232,6 +275,12 @@ class RestartAlerts(QObject):
                 config.log("[alerts] 注册通知显示名失败（不拦发送）：%r" % e)
             self._identity_registered = True
         xml = build_toast_xml(title, message, join_url)
+
+        # 先推灵动岛卡片：它一到，宿主就会把之后同标题的系统通知镜像跳过，免得弹两遍。
+        threading.Thread(target=push_island,
+                         args=(build_island_payload(title, message, join_url),),
+                         daemon=True, name="sl-restart-island").start()
+
         thread = threading.Thread(target=self._send_notification,
                                   args=(executable, xml), daemon=True,
                                   name="sl-restart-notification")
@@ -278,6 +327,12 @@ class RestartAlerts(QObject):
         self.status.emit(reason)
 
     def stop(self):
+        """退出时最多等 0.5 秒：通知线程都是 daemon，剩下的交给进程退出。"""
         self.stop_sound()
+        deadline = time.monotonic() + 0.5
         for thread in self._threads:
-            thread.join(timeout=2.0)
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            thread.join(timeout=left)
+        self._threads = [t for t in self._threads if t.is_alive()]

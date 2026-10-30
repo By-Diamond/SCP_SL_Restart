@@ -156,22 +156,30 @@ def test_config_roundtrip(tmp):
     assert cfg["counter_font"] == 16 and cfg["restart_font"] == 28
     assert tuple(cfg["counter_pos"]) == (10, 10) and tuple(cfg["restart_pos"]) == (10, 48)
     assert cfg["show_timer"] is True                       # 计时器默认开
+    assert cfg["show_counter"] is True                     # 人数条默认显示
+    assert cfg["show_toast"] is True                       # 重启提示框默认开
+    assert cfg["round_min_players"] == 2 and cfg["round_start_delay"] == 45
     assert cfg["timer_yellow_after"] == 1200               # 20 分钟变黄
     assert all(s["timer"] for s in cfg["servers"])         # 每台服默认都显示
 
     cfg["servers"] = [{"addr": "9.9.9.9:7777", "name": "9服", "timer": False}]
     cfg["interval"] = 2.0
     cfg["show_timer"] = False
+    cfg["show_counter"] = False                            # 用户关掉人数条
     config.save(cfg)
     again = config.load()
     assert again["servers"] == [{"addr": "9.9.9.9:7777", "name": "9服", "timer": False}], again
     assert again["interval"] == 2.0
     assert again["show_timer"] is False
+    assert again["show_counter"] is False                  # 下次启动也保持关闭
 
     with open(config.path("settings.json"), "w", encoding="utf-8") as f:
-        f.write('{"interval": 3, "不认识的键": 1, "servers": "坏了"}')
+        f.write('{"interval": 3, "不认识的键": 1, "servers": "坏了", "show_counter": "false",'
+                ' "round_min_players": 999, "round_start_delay": -5}')
     fixed = config.load()
     assert fixed["interval"] == 3
+    assert fixed["show_counter"] is True                   # 非布尔值回落默认，不能变成"假关闭"
+    assert fixed["round_min_players"] == 100 and fixed["round_start_delay"] == 0   # 越界夹紧
     assert [s["name"] for s in fixed["servers"]] == ["1服", "3服", "5服"]   # 坏清单回落默认
     assert [s["timer"] for s in fixed["servers"]] == [True, True, True]
     config.log("自检写入一行日志")
@@ -183,6 +191,7 @@ def test_monitor_round(tmp):
     cfg = config.load()
     cfg["servers"] = [{"addr": "1.1.1.1:7777", "name": "1服", "timer": True},
                       {"addr": "1.1.1.1:7779", "name": "3服", "timer": True}]
+    cfg.update(round_min_players=1, round_start_delay=0)   # 本用例只验攒秒，跳过开局估算
     clock = Clock()
     fake = FakeA2S({"1.1.1.1:7777": [info(41), info(41), info(41), info(0)],
                     "1.1.1.1:7779": [None, None, info(5)]})
@@ -242,6 +251,7 @@ def test_monitor_round(tmp):
     config.set_base_dir(off_dir)
     cfg2 = config.load()
     cfg2["servers"] = [{"addr": "9.9.9.9:7777", "name": "9服", "timer": True}]
+    cfg2.update(round_min_players=1, round_start_delay=0)
     clock2 = Clock()
     fake_off = FakeA2S({"9.9.9.9:7777": [info(7), None, None]})
     old, a2s.query = a2s.query, fake_off
@@ -276,6 +286,7 @@ def test_timer_switch(tmp):
     cfg = config.load()
     cfg["servers"] = [{"addr": "1.1.1.1:7777", "name": "1服", "timer": True},
                       {"addr": "1.1.1.1:7779", "name": "3服", "timer": False}]
+    cfg.update(round_min_players=1, round_start_delay=0)
     old, a2s.query = a2s.query, FakeA2S({"1.1.1.1:7777": [info(10)],
                                          "1.1.1.1:7779": [info(20)]})
     try:
@@ -292,6 +303,110 @@ def test_timer_switch(tmp):
         a2s.query = old
 
 
+def test_grab(tmp):
+    """自动挤服：低于阈值立即命中并自动关闭；阈值留空 = 人数上限；只进一次。"""
+    dir_ = os.path.join(tmp, "grab")
+    os.makedirs(dir_, exist_ok=True)
+    config.set_base_dir(dir_)
+    cfg = config.load()
+    cfg["servers"] = [{"addr": "1.1.1.1:7777", "name": "1服", "timer": True}]
+    fake = FakeA2S({"1.1.1.1:7777": [info(41), info(0), info(5)]})
+    old, a2s.query = a2s.query, fake
+    try:
+        m = Monitor(cfg)
+        m._clock = Clock()
+        m.set_grab([{"addr": "1.1.1.1:7777", "name": "1服", "enabled": True,
+                     "threshold": 30}], True)
+        m._round()                       # 41 人 >= 阈值 30：不打扰
+        assert m.take_grab_hits() == [] and m._grab_enabled
+        assert fake.calls == ["1.1.1.1:7777"], fake.calls   # 清单里的挤服服不重复发包
+
+        m._round()                       # 掉到 0（< 30）→ 命中，挤服自动关闭
+        hits = m.take_grab_hits()
+        assert hits == [{"addr": "1.1.1.1:7777", "name": "1服", "players": 0,
+                         "max": 45, "threshold": 30}], hits
+        assert not m._grab_enabled
+
+        m._round()                       # 已自动关闭：人数回来也不再触发
+        assert m.take_grab_hits() == []
+
+        # 阈值留空 = 人数上限：5/45 也算有空位
+        m.set_grab([{"addr": "1.1.1.1:7777", "name": "1服", "enabled": True,
+                     "threshold": None}], True)
+        m._round()
+        hits = m.take_grab_hits()
+        assert hits and hits[0]["threshold"] == 45 and hits[0]["players"] == 5, hits
+
+        # 关闭：待处理的命中被清掉
+        m.set_grab([], False)
+        assert m.take_grab_hits() == []
+    finally:
+        a2s.query = old
+
+
+def test_api_port(tmp):
+    """第三方适配：/snapshot 返回快照（含现算的回合时长），/ 自述，其它 404，只绑回环。"""
+    import json
+    import socket
+    import time
+    import urllib.error
+    import urllib.request
+
+    from api_server import ApiServer
+
+    config.set_base_dir(tmp)
+    cfg = config.load()
+    cfg["servers"] = [{"addr": "2.2.2.2:7777", "name": "1服", "timer": True}]
+    cfg.update(round_min_players=1, round_start_delay=0)
+    fake = FakeA2S({"2.2.2.2:7777": [info(12)]})
+    old, a2s.query = a2s.query, fake
+    try:
+        m = Monitor(cfg)
+        m._clock = Clock()
+        m._round()
+        m._clock.tick()
+        m._round()                       # 攒 1 秒回合时长
+        api = ApiServer(m, lambda: cfg)
+        assert not api.running
+        assert api.start(0)              # 端口 0 = 随机空闲端口
+        assert api.running
+        port = api._srv.server_address[1]
+        assert api._srv.server_address[0] == "127.0.0.1"   # 只绑回环
+        try:
+            with urllib.request.urlopen(
+                    "http://127.0.0.1:%d/snapshot" % port, timeout=3) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            assert data["app"] == "SL_Restart"
+            assert data["online"] == 1
+            (srv,) = data["servers"]
+            assert srv["name"] == "1服", srv
+            assert srv["players"] == 12 and srv["max"] == 45, srv
+            assert srv["online"] and not srv["stale"], srv
+            assert srv["timer"] == 1 and srv["timer_on"], srv   # 现算好的回合时长
+            with urllib.request.urlopen("http://127.0.0.1:%d/" % port,
+                                        timeout=3) as r:
+                assert json.loads(r.read().decode("utf-8"))["app"] == "SL_Restart"
+            try:
+                urllib.request.urlopen("http://127.0.0.1:%d/nope" % port, timeout=3)
+                raise AssertionError("404 expected")
+            except urllib.error.HTTPError as e:
+                assert e.code == 404
+
+            # 退出不许被挂着 keep-alive 的第三方客户端拖住（灵动岛之类会一直连着）
+            keep = socket.create_connection(("127.0.0.1", port), timeout=3)
+            keep.sendall(b"GET /snapshot HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n")
+            assert keep.recv(4096), "keep-alive 客户端没拿到响应"
+            t0 = time.time()
+            api.stop()
+            assert time.time() - t0 < 2.0, "关闭端口被长连接拖住 %.1fs" % (time.time() - t0)
+            keep.close()
+        finally:
+            api.stop()                   # 重复 stop 也不许报错
+        assert not api.running
+    finally:
+        a2s.query = old
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="sl_restart_test_")
     tests = [("A2S 回包解析", test_a2s_parse),
@@ -301,7 +416,9 @@ def main():
              ("回合时长文案/变黄", test_duration_text),
              ("配置读写", lambda: test_config_roundtrip(tmp)),
              ("一轮采集（打桩）", lambda: test_monitor_round(tmp)),
-             ("时长开关", lambda: test_timer_switch(tmp))]
+             ("时长开关", lambda: test_timer_switch(tmp)),
+             ("自动挤服", lambda: test_grab(tmp)),
+             ("第三方适配端口", lambda: test_api_port(tmp))]
     failed = 0
     try:
         for name, fn in tests:
