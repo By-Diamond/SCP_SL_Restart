@@ -42,6 +42,15 @@ def join_url_for(addr):
     return JOIN_URL_PREFIX + addr
 
 
+def island_join_url(addr, port):
+    """灵动岛「进服」按钮的目标：本程序自己的 HTTP 接口。
+
+    走 `slrestart://` 协议等于再起一个打包 exe，得先解包 59 MB 才轮到进服（实测 1.6 秒起，
+    冷启动更久）；打本地接口就是在已运行的进程里直接 `steam://connect`，毫秒级。
+    """
+    return "http://127.0.0.1:%d/join?addr=%s" % (int(port), addr)
+
+
 def app_icon_path():
     """程序图标：优先 assets/app.ico（宿主当普通图片读），没有就给 exe 自身（宿主抽 Shell 图标）。"""
     ico = os.path.join(config.base_dir(), "assets", "app.ico")
@@ -52,20 +61,23 @@ def app_icon_path():
     return ""
 
 
-def build_island_payload(title, message, join_url=""):
-    """灵动岛卡片：标题/正文与系统通知一致，额外带点击目标和「进服」按钮。
+def build_island_payload(title, message, addr="", api_port=None):
+    """灵动岛卡片：标题/正文与系统通知一致，额外带「进服」按钮。
 
     Windows 的通知监听 API 只暴露文本（读不到 <actions> 里的按钮），
     所以带按钮的卡片必须由发送方自己把目标一并推给灵动岛。
+
+    * `onClick="dismiss"`：点卡片本体**只收起卡片**，不进服也不唤醒程序——
+      想进服请点「进服」按钮；Windows 通知中心那条是独立发的，不受影响。
+    * 不再给顶层 `url`：以前它让整张卡片都变成进服热区。
     """
     payload = {"kind": "SL Restart", "title": title, "subtitle": message,
-               "duration": ISLAND_TOAST_SECONDS}
+               "duration": ISLAND_TOAST_SECONDS, "onClick": "dismiss"}
     icon = app_icon_path()
     if icon:
         payload["icon"] = icon
-    if join_url:
-        payload["url"] = join_url
-        payload["buttons"] = [{"text": "进服", "uri": join_url}]
+    if addr and api_port:
+        payload["buttons"] = [{"text": "进服", "uri": island_join_url(addr, api_port)}]
     return payload
 
 
@@ -216,7 +228,8 @@ class RestartAlerts(QObject):
             for name, addr in events:
                 self.show_notification("SCP:SL 服务器重启",
                                        "[%s] 重启" % name,
-                                       join_url=join_url_for(addr))
+                                       join_url=join_url_for(addr),
+                                       api_port=cfg.get("api_port") or 17777)
 
     def play_sound(self, path="", volume=70):
         self.stop_sound()
@@ -255,8 +268,12 @@ class RestartAlerts(QObject):
 
     # ----------------------------- Windows 通知 -----------------------------
 
-    def show_notification(self, title, message, join_url=""):
-        """把通知交给后台线程去发，绝不阻塞 UI；结果经 status 信号回 UI 线程。"""
+    def show_notification(self, title, message, join_url="", api_port=None):
+        """把通知交给后台线程去发，绝不阻塞 UI；结果经 status 信号回 UI 线程。
+
+        `join_url` 只给 Windows 原生通知用（它只认协议激活）；灵动岛卡片改用
+        `api_port` 的本地接口，点按钮不用起新进程。
+        """
         if sys.platform != "win32":
             self.status.emit("Windows 通知仅支持 Windows 10/11。")
             return
@@ -275,10 +292,11 @@ class RestartAlerts(QObject):
                 config.log("[alerts] 注册通知显示名失败（不拦发送）：%r" % e)
             self._identity_registered = True
         xml = build_toast_xml(title, message, join_url)
+        addr = join_url[len(JOIN_URL_PREFIX):] if join_url.startswith(JOIN_URL_PREFIX) else ""
 
         # 先推灵动岛卡片：它一到，宿主就会把之后同标题的系统通知镜像跳过，免得弹两遍。
         threading.Thread(target=push_island,
-                         args=(build_island_payload(title, message, join_url),),
+                         args=(build_island_payload(title, message, addr, api_port),),
                          daemon=True, name="sl-restart-island").start()
 
         thread = threading.Thread(target=self._send_notification,

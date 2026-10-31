@@ -100,7 +100,7 @@ class AlertDialog(QDialog):
         layout.addWidget(hint)
         layout.addLayout(notifications)
         layout.addLayout(timing)
-        timing_hint = QLabel("回合时长是本地估算：达到人数门槛先显示「开局」，倒计时结束才开始计时。\n"
+        timing_hint = QLabel("回合时长是本地估算：达到人数门槛先显示「等待 0:45」，倒计时结束才开始计时。\n"
                              "改估算参数会重新计时；中途打开程序无法还原已进行的回合。")
         timing_hint.setWordWrap(True)
         layout.addWidget(timing_hint)

@@ -11,7 +11,7 @@ import os
 import sys
 from datetime import datetime
 
-VERSION = "0.4.1"               # 单一来源：关于窗口用它；tools/version_info.txt 需手工同步
+VERSION = "0.4.2"               # 单一来源：关于窗口用它；tools/version_info.txt 需手工同步
 
 DEFAULTS = {
     "servers": [

@@ -8,7 +8,7 @@
 
 掉线要**连续失败 N 次**（默认 2）才判，免得网络抖动误报成重启。
 
-顺带估算**回合时长**：人数达到门槛后先走「开局」倒计时，倒计时结束才开始计时；
+顺带估算**回合时长**：人数达到门槛后先显示「等待 m:ss」倒计时，倒计时结束才开始计时；
 人数 0 / 确认离线时重置，暂停和查询失败时不补算空档。
 
 不依赖 Qt：采集跑在后台线程，负责写 `history.csv` / `latest.md` / `events.log`。
@@ -21,6 +21,7 @@ import math
 import os
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 import a2s
@@ -28,6 +29,10 @@ import config
 
 SEP = "  |  "
 YELLOW = "yellow"               # 时长超阈值的那一段，UI 负责换成黄色
+
+FULL_START_GRACE_S = 1.0        # 开局倒计时中满员：持续满 1 秒就直接起算回合时长
+QUIET_WINDOW_S = 10.0           # 重启抑制：回看最近 10 秒的人数
+QUIET_MAX_PLAYERS = 2           # 重启抑制：这 10 秒一直 ≤2 人且没开局，就不算重启
 
 
 def restart_kind(prev_players, now_players):
@@ -94,6 +99,9 @@ class Monitor:
         self._timer = {}           # addr -> 回合时长（只累加"在线且有人"的秒数）
         self._round_phase = {}     # waiting / countdown / running；本地估算，不是服务端事件
         self._countdown = {}       # addr -> 已观察到的连续开局等待秒数
+        self._full_since = {}      # addr -> 倒计时中人数达到上限的时刻（满员加速开局）
+        self._started_at = {}      # addr -> 最近一次开始计时回合时长的时刻
+        self._recent = {}          # addr -> deque[(时刻, 人数)]，用于「过去 10 秒」重启抑制
         self._t_prev = None        # 上一轮的时刻，用来算这一轮该加多少秒
         self._clock = time.monotonic
         self._show_timer = bool(cfg.get("show_timer", True))
@@ -124,6 +132,9 @@ class Monitor:
             self._timer.clear()
             self._round_phase.clear()
             self._countdown.clear()
+            self._full_since.clear()
+            self._started_at.clear()
+            self._recent.clear()
             self._t_prev = None
             self._players = {s["addr"]: None for s in self._servers}
             self.snapshot = self._make_snapshot()
@@ -182,6 +193,8 @@ class Monitor:
             self._timer.clear()
             self._round_phase.clear()
             self._countdown.clear()
+            self._full_since.clear()
+            self._started_at.clear()
             self.snapshot = self._make_snapshot()
 
     def _cancel_countdowns(self):
@@ -190,29 +203,78 @@ class Monitor:
             if phase == "countdown":
                 self._round_phase[addr] = "waiting"
                 self._countdown[addr] = 0.0
+                self._full_since.pop(addr, None)
 
-    def _advance_round(self, addr, players, dt):
-        """本地估算：等够门槛 -> 倒计时 -> 从 0:00 计时。"""
+    def _advance_round(self, addr, players, maxplayers, dt, now_t):
+        """本地估算：等够门槛 -> 倒计时 -> 从 0:00 计时。
+
+        倒计时中人数达到服务器上限（满员）并持续 1 秒，就直接开局——
+        满员说明回合大概率已经开了，不用再等满 45 秒。
+        """
         minimum = self.cfg.get("round_min_players", 2)
         delay = self.cfg.get("round_start_delay", 45)
         phase = self._round_phase.get(addr, "waiting")
         if phase == "running":
             self._timer[addr] = self._timer.get(addr, 0.0) + dt
-        elif players < minimum:
+            return
+        if players < minimum:
             self._round_phase[addr] = "waiting"
             self._countdown[addr] = 0.0
-        elif delay == 0:
+            self._full_since.pop(addr, None)
+            return
+        if delay == 0:
             self._round_phase[addr] = "running"
             self._timer[addr] = self._timer.get(addr, 0.0) + dt
-        elif phase != "countdown":
+            self._started_at[addr] = now_t
+            self._full_since.pop(addr, None)
+            return
+        if phase != "countdown":
             self._round_phase[addr] = "countdown"
             self._countdown[addr] = 0.0
+            elapsed = 0.0
         else:
             elapsed = self._countdown.get(addr, 0.0) + dt
-            self._countdown[addr] = elapsed
-            if elapsed >= delay:
+        if maxplayers and players >= maxplayers:            # 满员：再等 1 秒就开局
+            since = self._full_since.get(addr)
+            if since is None:
+                self._full_since[addr] = now_t
+            elif now_t - since >= FULL_START_GRACE_S:
                 self._round_phase[addr] = "running"
-                self._timer[addr] = elapsed - delay     # 倒计时多出来的部分算进回合时长
+                self._timer[addr] = 0.0
+                self._started_at[addr] = now_t
+                self._full_since.pop(addr, None)
+                return
+        else:
+            self._full_since.pop(addr, None)
+        self._countdown[addr] = elapsed
+        if elapsed >= delay:
+            self._round_phase[addr] = "running"
+            self._timer[addr] = elapsed - delay     # 倒计时多出来的部分算进回合时长
+            self._started_at[addr] = now_t
+            self._full_since.pop(addr, None)
+
+    def _track_players(self, addr, now_t, players):
+        """记一条人数采样，只保留最近 10 秒（重启抑制用）。"""
+        history = self._recent.setdefault(addr, deque())
+        history.append((now_t, players))
+        cutoff = now_t - QUIET_WINDOW_S
+        while history and history[0][0] < cutoff:
+            history.popleft()
+
+    def _is_quiet_restart(self, addr, now_t):
+        """重启抑制：过去 10 秒人数一直 ≤2 且没开过局，就不算重启。
+
+        空服掉线 / 归零本来就没有回合可丢，弹提示只会打扰。
+        """
+        if self._round_phase.get(addr) == "running":
+            return False
+        started = self._started_at.get(addr)
+        if started is not None and now_t - started <= QUIET_WINDOW_S:
+            return False
+        history = self._recent.get(addr)
+        if not history:
+            return False
+        return all(p is not None and p <= QUIET_MAX_PLAYERS for _t, p in history)
 
     def _timer_on(self, s):
         """这台服要不要显示时长：总开关开着 且 这台服自己勾了。"""
@@ -238,9 +300,8 @@ class Monitor:
             elif phase == "countdown":
                 remaining = max(0, self.cfg.get("round_start_delay", 45)
                                 - self._countdown.get(addr, 0))
-                segs.append((" 开局" + fmt_duration(math.ceil(remaining)), None))
-            else:
-                segs.append((" 等待%d人" % self.cfg.get("round_min_players", 2), None))
+                segs.append((" 等待 " + fmt_duration(math.ceil(remaining)), None))
+            # waiting：人数还不够门槛，时间栏留空（什么都不显示）
         return {"text": segments_text(segs), "segments": segs, "rows": list(rows),
                 "stamp": stamp, "online": online}
 
@@ -311,24 +372,33 @@ class Monitor:
                 self._fails[addr] = 0                        # 查询成功：清零，别让「失败-成功-失败」误判
                 live += 1
                 now = r["players"]
+                self._track_players(addr, t_now, now)
                 kind = restart_kind(prev, now)
+                quiet = bool(kind) and self._is_quiet_restart(addr, t_now)
                 if prev is None and addr in self._prev:      # 上轮查不到、这轮通了
                     events.append("%s(%s) 上线 %d/%d" % (name, addr, now, r["maxplayers"]))
                 if kind == "zero":
-                    events.append("%s(%s) 人数归零 %d -> 0（疑似服务器重启）" % (name, addr, prev))
+                    if quiet:
+                        events.append("%s(%s) 人数归零 %d -> 0（过去 %d 秒 ≤%d 人且未开局，忽略重启）"
+                                      % (name, addr, prev, int(QUIET_WINDOW_S), QUIET_MAX_PLAYERS))
+                    else:
+                        events.append("%s(%s) 人数归零 %d -> 0（疑似服务器重启）" % (name, addr, prev))
                 if kind:
                     timers[addr] = 0.0                       # 重启 -> 回合时长清零
                     self._round_phase[addr] = "waiting"
                     self._countdown[addr] = 0.0
-                    restarts.append((name, addr))
+                    self._full_since.pop(addr, None)
+                    if not quiet:
+                        restarts.append((name, addr))
                 elif now > 0 and not self._paused:
-                    self._advance_round(addr, now, dt)       # 在线且有人 -> 按状态估算
+                    self._advance_round(addr, now, r["maxplayers"], dt, t_now)   # 在线且有人 -> 按状态估算
                     timers[addr] = self._timer.get(addr, 0.0)
                 self._prev[addr] = now
             else:
                 if self._round_phase.get(addr) == "countdown":
                     self._round_phase[addr] = "waiting"
                     self._countdown[addr] = 0.0
+                    self._full_since.pop(addr, None)
                 n = self._fails.get(addr, 0) + 1
                 self._fails[addr] = n
                 if n < max_fails:                # 第 1 次失败：显示与计时都保持上一次的样子
@@ -338,21 +408,35 @@ class Monitor:
                     now = None
                     if prev is not None:
                         if restart_kind(prev, None):             # >0 掉线：也算一次重启
-                            events.append("%s(%s) 掉线 %d -> 查不到（疑似服务器重启）"
-                                          % (name, addr, prev))
-                            restarts.append((name, addr))
+                            quiet = self._is_quiet_restart(addr, t_now)
+                            if quiet:
+                                events.append("%s(%s) 掉线 %d -> 查不到（过去 %d 秒 ≤%d 人且未开局，忽略重启）"
+                                              % (name, addr, prev, int(QUIET_WINDOW_S), QUIET_MAX_PLAYERS))
+                            else:
+                                events.append("%s(%s) 掉线 %d -> 查不到（疑似服务器重启）"
+                                              % (name, addr, prev))
+                                restarts.append((name, addr))
                             timers[addr] = 0.0
                             self._round_phase[addr] = "waiting"
                             self._countdown[addr] = 0.0
+                            self._full_since.pop(addr, None)
                         else:
                             events.append("%s(%s) 离线" % (name, addr))
                     self._prev[addr] = None      # 记下"见过、当前离线"，之后上线才记得住
+            # 阶段也要给出去：数字端口 / 灵动岛插件只拿 timer 是分不清
+            # 「还没开局（时间栏留空）」和「倒计时（等待 0:32）」的，都会画成 0:00。
+            phase = self._round_phase.get(addr, "waiting")
+            left = 0
+            if phase == "countdown":
+                left = int(math.ceil(max(0, self.cfg.get("round_start_delay", 45)
+                                         - self._countdown.get(addr, 0.0))))
             players[addr] = now
             rows.append({"name": name, "addr": addr, "players": now,
                          "max": r["maxplayers"] if r else None,
                          "online": bool(r), "stale": stale,
                          "timer": int(timers.get(addr) or 0),
-                         "timer_on": self._timer_on(s)})
+                         "timer_on": self._timer_on(s),
+                         "phase": phase, "countdown": left})
 
         self._players = players
         self._timer = timers

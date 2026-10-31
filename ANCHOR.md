@@ -1,7 +1,7 @@
 # ANCHOR — SL Restart
 
 > 给接手的大模型 / 协作者看的项目锚点。读完这份就能改代码，不必翻全部历史。
-> 最后更新：2026-10-30（v0.4.1，未提交改动见文末）
+> 最后更新：2026-10-31（v0.4.2）
 
 ## 1. 这是什么
 
@@ -42,7 +42,7 @@ sl_restart.py (UI 线程)
 | `config.py` | `DEFAULTS` / `load()` 归一 / `save()` / 路径 / 版本号 / 日志 |
 | `overlay.py` | `Overlay`（人数条 + 重启提示同一个类，靠 duration/movable 区分） |
 | `alerts.py` | 提示音、Windows 通知（PowerShell Toast + 自定义协议进服按钮） |
-| `api_server.py` | 只读 HTTP（`GET /snapshot`、`GET /`），只绑回环 |
+| `api_server.py` | 只读 HTTP（`GET /snapshot`、`GET /join?addr=`、`GET /`），只绑回环 |
 | `tray.py` / `autostart.py` / `joiner.py` | 托盘图标菜单、开机自启（HKCU）、steam 直连 |
 | `a2s.py` | 极简 A2S_INFO 查询（不依赖第三方库） |
 | `server_dialog.py` / `grab_dialog.py` / `alert_dialog.py` / `about.py` | 四个对话框 |
@@ -73,19 +73,32 @@ sl_restart.py (UI 线程)
 
 ```
 waiting ──人数≥门槛──> countdown ──等够 delay──> running
-   ↑                        │                      │
-   └──人数<门槛 / 查询失败 / 暂停 / 采样间隔>5s───────┘（running 不受影响）
+   │                        │  └──满员持续1秒──────> running（timer 从 0:00 起算）
+   └──人数<门槛 / 查询失败 / 暂停 / 采样间隔>5s────────┘（running 不受影响）
 ```
 
-1. `waiting`：显示 ` 等待N人`（N = `round_min_players`）。
-2. `countdown`：显示 ` 开局0:45`（剩余秒数向上取整，**不带 `≈`**）。
+1. `waiting`：人数不够门槛，**时间栏留空**（不显示任何文字）。
+2. `countdown`：显示 ` 等待 0:45`（`等待 ` + `fmt_duration(ceil(剩余秒数))`，**不带 `≈`**）。
 3. `running`：显示 ` 0:00` 起累加；超过阈值那一段标 `yellow`。
 4. 转 `running` 时 `timer = 已观察秒数 - delay`（多出来的部分不丢）。
-5. `running` 后降到 1 人**继续计时**；人数归零 / 确认掉线 → 重置为 `waiting`。
-6. **暂停**：`set_paused(True)` 取消倒计时；暂停期间手动刷新不推进（`not self._paused` 才 `_advance_round`）。
-7. 改估算参数 → `reset_round_timers()`：清时长/阶段/倒计时，不动人数与重启历史。
+5. **满员加速**：`countdown` 中人数达到服务器上限并持续 `FULL_START_GRACE_S=1s` → 直接 `running`、`timer = 0`。
+   起始时刻记在 `_full_since`，人数掉下满员就取消；剩余倒计时先到的按普通规则走。
+6. `running` 后降到 1 人**继续计时**；人数归零 / 确认掉线 → 重置为 `waiting`。
+7. **暂停**：`set_paused(True)` 取消倒计时；暂停期间手动刷新不推进（`not self._paused` 才 `_advance_round`）。
+8. 改估算参数 → `reset_round_timers()`：清时长/阶段/倒计时，不动人数与重启历史。
 
 相关方法：`reset_round_timers()` / `_cancel_countdowns()` / `_advance_round()` / `_make_snapshot()`。
+
+**外部可见字段**（`GET /snapshot` 的每台服）：`timer`（秒）、`timer_on`、`phase`
+（`waiting` / `countdown` / `running`）、`countdown`（倒计时剩余秒）。凡是要显示时间栏的
+消费方（如灵动岛插件）都必须读 `phase`：只拿 `timer` 会把「没到门槛」和「倒计时」都画成 `0:00`。
+
+### 5.1 灵动岛「进服」按钮走本地接口
+
+`GET /join?addr=IP:端口` → 后台线程 `joiner.join(addr)`（`steam://connect`），立刻返回 200；
+地址非法返回 400。岛上的按钮用 `http://127.0.0.1:<api_port>/join?addr=…`，别再走
+`slrestart://` 协议——那会新起一个打包 exe、先解包 59 MB（实测 1.6 s 起），慢到用户以为没反应。
+协议注册仍然保留：**Windows 原生通知**的按钮只能走协议激活。
 
 ## 6. 重启判定（`restart_kind`）
 
@@ -93,6 +106,9 @@ waiting ──人数≥门槛──> countdown ──等够 delay──> running
 2. 人数 **>0 → 查不到**：要**连续 `offline_fails` 次**失败才判 `offline`。
 3. **查询成功即 `_fails[addr]=0`**——否则「失败→成功→失败」会被误判成掉线，还会把时长清空。
 4. 本来就 0 人 / 本来就离线，不重复报。
+5. **空服抑制**：判定为重启时，若过去 `QUIET_WINDOW_S=10s` 内所有采样都 ≤ `QUIET_MAX_PLAYERS=2`、且这 10 秒没开过局
+   （`_started_at` 不在窗口内，当前也不是 `running`）→ 只写 `events.log`「忽略重启」，**不弹提示、不进 `_pending`**；
+   时长 / 阶段照常重置。采样历史存在 `_recent[addr]`（`deque[(monotonic, players)]`，只留 10 秒）。
 
 ## 7. 运行产物（exe 同目录）
 
@@ -134,7 +150,10 @@ build.bat            :: PyInstaller 单文件 → dist\SL Restart.exe
 
 ## 11. 当前状态
 
-1. 版本 `0.4.1`；`dist\SL Restart.exe` 已按旧代码打包，**本轮改动尚未重新打包**。
-2. 本轮新增：`show_toast` 开关、`round_min_players` / `round_start_delay` 与回合估算状态机。
-3. `README.md` 仍是旧描述（未写「开局估算」和「启用重启提示框」）。
-4. git 工作区有大量未提交改动（含未跟踪 `api_server.py`、`grab_dialog.py`、`run.bat`、`tests/verify_round_timer.py`）。
+1. 版本 `0.4.2`；`dist\SL Restart.exe` 已按最新代码打包（59,211,455 字节，`FileVersion = 0.4.2`）。
+2. 本轮改动：满员 1 秒加速开局（`FULL_START_GRACE_S` / `_full_since`）、空服重启抑制（`QUIET_WINDOW_S` / `_recent`）、
+   时间栏改「等待 0:45」且不够门槛留空；第三方适配新增 `GET /join`、快照新增 `phase` / `countdown`，
+   灵动岛按钮改走本地接口（不再起新进程解包）。
+3. `README.md` 与本文件已同步新规则。
+4. git：v0.4.1 已推送（`3dc2219`）；v0.4.2 改动见本次提交。
+5. `dist\旧版_4849_可删.exe` 是上一版残留，旧实例退出后可直接删。

@@ -6,7 +6,8 @@
 第三方程序（如灵动岛插件）——数据都是 monitor 已经算好的，这里只做搬运。
 
 * 只绑 127.0.0.1，不监听外网；菜单不开就完全不起服务。
-* 接口：GET /snapshot -> 快照 JSON；GET / -> 自述；其它 404。
+* 接口：GET /snapshot -> 快照 JSON；GET /join?addr=IP:端口 -> 一键进服；
+  GET / -> 自述；其它 404。
 * 不依赖 Qt，跑在后台线程；读的只是 monitor.snapshot（原子引用），
   不会碰 socket 查询、也不会碰 UI。
 """
@@ -27,11 +28,14 @@ class _Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path.rstrip("/") in ("/snapshot", ):
             self._send(200, self.server.api.snapshot())
+        elif path.rstrip("/") == "/join":
+            self._send(*self.server.api.join(self.path))
         elif path == "/":
             self._send(200, {"app": APP, "version": config.VERSION,
-                             "endpoints": ["/snapshot"]})
+                             "endpoints": ["/snapshot", "/join?addr=IP:端口"]})
         else:
-            self._send(404, {"error": "not found", "endpoints": ["/snapshot"]})
+            self._send(404, {"error": "not found",
+                             "endpoints": ["/snapshot", "/join?addr=IP:端口"]})
 
     def _send(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -92,6 +96,29 @@ class ApiServer:
     def running(self):
         return self._srv is not None
 
+    def join(self, path):
+        """GET /join?addr=IP:端口：灵动岛卡片的「进服」按钮走这里。
+
+        按钮如果走 `slrestart://` 协议，会**新起一个打包 exe、重新解包**才轮到进服，
+        实测 1.6 秒起步（冷启动更久）；直接打到已运行的进程就只剩 os.startfile 的时间。
+        """
+        from urllib.parse import parse_qs, urlparse
+        addr = (parse_qs(urlparse(path).query).get("addr") or [""])[0].strip()
+        if not config.parse_addr(addr):
+            return 400, {"ok": False, "error": "invalid addr", "addr": addr}
+        threading.Thread(target=self._join_async, args=(addr,),
+                         name="join", daemon=True).start()
+        return 200, {"ok": True, "addr": addr}
+
+    @staticmethod
+    def _join_async(addr):
+        try:
+            import joiner
+            ok, msg = joiner.join(addr)
+            config.log("[api] 灵动岛按钮进服 %s：ok=%s %s" % (addr, ok, msg))
+        except Exception as e:                    # 后台线程炸了不能影响服务
+            config.log("[api] 灵动岛按钮进服失败：%r" % e)
+
     def snapshot(self):
         """组装快照 JSON：每次请求现取，monitor.snapshot 是原子引用，无锁可读。"""
         cfg = self._cfg() or {}
@@ -108,6 +135,9 @@ class ApiServer:
                 "stale": bool(r.get("stale")),
                 "timer": int(r.get("timer") or 0),      # monitor 已算好的回合时长（秒）
                 "timer_on": bool(r.get("timer_on")),
+                # 阶段：waiting（人数不够门槛，时间栏留空）/ countdown（等待 m:ss）/ running
+                "phase": r.get("phase") or "waiting",
+                "countdown": int(r.get("countdown") or 0),   # 倒计时剩余秒（仅 countdown 阶段）
             })
         return {
             "app": APP,
