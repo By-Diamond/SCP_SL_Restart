@@ -105,7 +105,7 @@ class Monitor:
         self._t_prev = None        # 上一轮的时刻，用来算这一轮该加多少秒
         self._clock = time.monotonic
         self._show_timer = bool(cfg.get("show_timer", True))
-        self._pending = []         # 待提示的重启事件（(服名, 地址)）
+        self._pending = []         # 待提示的重启事件（(服名, 地址, 10 秒内最高人数)）
         self._grab_servers = []    # 自动挤服：已勾选的 {"addr","name","threshold"}，按优先顺序
         self._grab_enabled = False
         self._grab_pending = []    # 待处理的挤服命中（dict：addr/name/players/max/threshold）
@@ -261,6 +261,11 @@ class Monitor:
         while history and history[0][0] < cutoff:
             history.popleft()
 
+    def _peak_players(self, addr, fallback=None):
+        """过去 10 秒内的最高人数（重启提示里的「x 人」用这个）。"""
+        counts = [p for _t, p in (self._recent.get(addr) or ()) if p is not None]
+        return max(counts) if counts else fallback
+
     def _is_quiet_restart(self, addr, now_t):
         """重启抑制：过去 10 秒人数一直 ≤2 且没开过局，就不算重启。
 
@@ -389,7 +394,7 @@ class Monitor:
                     self._countdown[addr] = 0.0
                     self._full_since.pop(addr, None)
                     if not quiet:
-                        restarts.append((name, addr))
+                        restarts.append((name, addr, self._peak_players(addr, prev)))
                 elif now > 0 and not self._paused:
                     self._advance_round(addr, now, r["maxplayers"], dt, t_now)   # 在线且有人 -> 按状态估算
                     timers[addr] = self._timer.get(addr, 0.0)
@@ -415,7 +420,7 @@ class Monitor:
                             else:
                                 events.append("%s(%s) 掉线 %d -> 查不到（疑似服务器重启）"
                                               % (name, addr, prev))
-                                restarts.append((name, addr))
+                                restarts.append((name, addr, self._peak_players(addr, prev)))
                             timers[addr] = 0.0
                             self._round_phase[addr] = "waiting"
                             self._countdown[addr] = 0.0

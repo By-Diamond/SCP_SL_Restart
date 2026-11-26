@@ -218,7 +218,7 @@ def test_monitor_round(tmp):
 
         clock.tick()
         m._round()                       # 7777 归零 -> 重启，时长清零
-        assert m.take_restarts() == [("1服", "1.1.1.1:7777")], m.snapshot
+        assert m.take_restarts() == [("1服", "1.1.1.1:7777", 41)], m.snapshot
         assert m.snapshot["text"] == "[1服] 0人  |  [3服] 5人 0:02", m.snapshot["text"]
 
         clock.tick()
@@ -268,7 +268,7 @@ def test_monitor_round(tmp):
 
         clock2.tick()
         m2._round()                      # 第 2 次失败 -> 掉线也算重启
-        assert m2.take_restarts() == [("9服", "9.9.9.9:7777")], m2.take_restarts()
+        assert m2.take_restarts() == [("9服", "9.9.9.9:7777", 7)], m2.take_restarts()
         assert m2.snapshot["text"] == "[9服] -人", m2.snapshot["text"]
         assert m2._timer["9.9.9.9:7777"] == 0.0, m2._timer        # 时长清零
         events = read("events.log")

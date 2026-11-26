@@ -25,11 +25,13 @@ import joiner
 from monitor import Monitor
 from overlay import Overlay
 from grab_dialog import GrabDialog
+from auto_join_dialog import AutoJoinDialog
 from server_dialog import ServersDialog
 from tray import Tray
 from tray import Tray
 
 SYNC_MS = 200
+AUTO_JOIN_DELAY_MS = 100      # 检测到重启后等 0.1 秒再进服
 
 
 def single_instance(name="SL_Restart_instance"):
@@ -64,7 +66,10 @@ class App:
                              duration=cfg["restart_seconds"],
                              color=cfg["restart_color"], bold=True,
                              alpha=cfg["alpha"], clickable=True)
-        self._toast_items = []          # 当前这条提示里的 (服名, 地址)，最后一个 = 晚重启的
+        self._toast_items = []          # 当前这条提示里的 (服名, 地址, 人数)，最后一个 = 晚重启的
+        self._auto_join_addrs = list(cfg.get("auto_join_servers") or [])   # 勾选的清单服务器
+        self._auto_join_on = False      # 每次启动都从关闭开始
+        self._auto_join_seq = 0         # 关掉/重开时让已排队的进服作废
         self.tray = Tray(app)
         self._build_menu()
 
@@ -98,7 +103,10 @@ class App:
               checkable=True)
         t.add("pause", "暂停监控", lambda: self._toggle_pause())
         t.add("refresh", "立即刷新", self.monitor.refresh_now)
+        self._join_menu = t.add_submenu("join", "进服")
+        self._fill_join_menu()
         t.add("grab", "自动挤服", self._toggle_grab, checkable=True)
+        t.add("autojoin", "重启自动进服", self._toggle_auto_join, checkable=True)
         t.sep()
         t.add("servers", "编辑服务器清单…", self._edit_servers)
         t.add("alerts", "提醒设置…", self._edit_alerts)
@@ -192,6 +200,65 @@ class App:
                    % (hit["name"], hit["addr"], hit["players"], hit["max"],
                       hit["threshold"], ok, msg))
 
+    def _toggle_auto_join(self):
+        """重启自动进服：勾上弹清单选服，检测到重启 0.1 秒后自动进服，进完自动关闭。"""
+        checked = self.tray.acts["autojoin"].isChecked()
+        self._auto_join_seq += 1                      # 关掉 / 重开：排队中的进服作废
+        if not checked:
+            self._auto_join_on = False
+            self.tray.tip("SL Restart · 重启自动进服已关闭")
+            config.log("[ui] 重启自动进服已关闭")
+            return
+        dlg = AutoJoinDialog(self.cfg["servers"], self._auto_join_addrs)
+        if dlg.exec() != AutoJoinDialog.DialogCode.Accepted:
+            self.tray.set_checked("autojoin", False)
+            return
+        addrs = dlg.result_addrs()
+        if not addrs:
+            QMessageBox.warning(None, "重启自动进服", "至少要勾选一台服务器。")
+            self.tray.set_checked("autojoin", False)
+            return
+        self._auto_join_addrs = addrs
+        self.cfg["auto_join_servers"] = addrs
+        try:
+            config.save(self.cfg)
+        except Exception as e:
+            config.log("[ui] 保存 settings.json 失败：%r" % e)
+        self._auto_join_on = True
+        self.tray.tip("SL Restart · 重启自动进服监控中（%d 台）" % len(addrs))
+        config.log("[ui] 重启自动进服已开启：%s" % addrs)
+
+    def _maybe_auto_join(self, restarts):
+        """名单里任意一台重启 -> 0.1 秒后进服；名单外 / 功能没开都不管。"""
+        if not self._auto_join_on:
+            return
+        hit = next(((n, a) for n, a, _p in restarts if a in self._auto_join_addrs), None)
+        if not hit:
+            return
+        name, addr = hit
+        if not self.cfg.get("windows_notifications"):   # 系统通知已开就不用重复提示
+            self.alerts.show_notification(
+                "重启自动进服", "[%s] 重启，%.1f 秒后自动进服" % (name, AUTO_JOIN_DELAY_MS / 1000.0))
+        seq = self._auto_join_seq
+        QTimer.singleShot(AUTO_JOIN_DELAY_MS, lambda: self._do_auto_join(name, addr, seq))
+        config.log("[ui] 重启自动进服：%s(%s) %.1f 秒后进服"
+                   % (name, addr, AUTO_JOIN_DELAY_MS / 1000.0))
+
+    def _do_auto_join(self, name, addr, seq):
+        """延迟到点：还在开启状态才真正进服，进完关闭功能（一次只进一台）。"""
+        if seq != self._auto_join_seq or not self._auto_join_on:
+            return
+        self._auto_join_on = False
+        self._auto_join_seq += 1
+        self.tray.set_checked("autojoin", False)
+        ok, msg = joiner.join(addr)
+        self.tray.tip("SL Restart · 已自动进服 %s" % name if ok
+                      else "SL Restart · 自动进服失败：%s" % msg)
+        if not ok:
+            self.tray.icon.showMessage("SL Restart", "加入 %s 失败：%s" % (name, msg),
+                                       QSystemTrayIcon.MessageIcon.Warning, 5000)
+        config.log("[ui] 重启自动进服 %s(%s)：ok=%s %s" % (name, addr, ok, msg))
+
     def _save_counter_position(self, x, y):
         self.cfg["counter_pos"] = [x, y]
         self._position_toast(x, y)
@@ -263,6 +330,31 @@ class App:
                                    QSystemTrayIcon.MessageIcon.Information, 3000)
         config.log("[ui] 开机自启=%s：%s" % (want, msg))
 
+    def _fill_join_menu(self):
+        """「进服」二级菜单：按服务器清单顺序列服名，点哪个进哪个。"""
+        menu = self._join_menu
+        menu.clear()
+        servers = self.cfg.get("servers") or []
+        if not servers:
+            empty = menu.addAction("（服务器清单为空）")
+            empty.setEnabled(False)
+            return
+        for s in servers:
+            name = s.get("name") or s["addr"]
+            action = menu.addAction(name)
+            action.triggered.connect(
+                lambda _=False, addr=s["addr"], name=name: self._join_server(addr, name))
+
+    def _join_server(self, addr, name):
+        """托盘快捷进服：直接 steam://connect 到清单里选中的那台。"""
+        ok, msg = joiner.join(addr)
+        if ok:
+            self.tray.tip("SL Restart · 正在进入 %s" % name)
+        else:
+            self.tray.icon.showMessage("SL Restart", "加入 %s 失败：%s" % (name, msg),
+                                       QSystemTrayIcon.MessageIcon.Warning, 5000)
+        config.log("[ui] 托盘进服 %s(%s)：ok=%s %s" % (name, addr, ok, msg))
+
     def _edit_servers(self):
         dlg = ServersDialog(self.cfg["servers"])
         if dlg.exec() != ServersDialog.DialogCode.Accepted:
@@ -274,6 +366,7 @@ class App:
         except Exception as e:
             config.log("[ui] 保存 settings.json 失败：%r" % e)
         self.monitor.set_servers(servers)
+        self._fill_join_menu()                  # 清单变了，「进服」子菜单跟着换
         self._draw_counter(self.monitor.snapshot, ensure_shown=False)   # 显隐听菜单的，不硬弹回来
         config.log("[ui] 服务器清单已更新：%s" % [s["addr"] for s in servers])
 
@@ -325,6 +418,7 @@ class App:
         restarts = self.monitor.take_restarts()
         if restarts:
             self._push_restart(restarts)
+            self._maybe_auto_join(restarts)
         hits = self.monitor.take_grab_hits()
         if hits:
             for hit in hits:
@@ -347,26 +441,28 @@ class App:
             if self.toast.isVisible():
                 self.toast.hide()
             config.log("[ui] 重启提示框已关闭，跳过弹框：%s"
-                       % " ".join(n for n, _a in restarts))
+                       % " ".join(n for n, _a, _p in restarts))
             self.alerts.notify_restart(restarts, self.cfg)
             return
         if not self.toast.isVisible():          # 上一条提示已经放完了，重新开始攒
             self._toast_items = []
+        known = [i[:2] for i in self._toast_items]
         for item in restarts:
-            if item not in self._toast_items:
+            if item[:2] not in known:          # 同一台服重复上报只留一条
+                known.append(item[:2])
                 self._toast_items.append(item)
         self._position_toast(self.counter.x(), self.counter.y())
-        self.toast.pop("%s 重启" % " ".join("[%s]" % n for n, _a in self._toast_items))
+        self.toast.pop("%s 重启" % " ".join("[%s]" % n for n, _a, _p in self._toast_items))
         self.alerts.notify_restart(restarts, self.cfg)
         config.log("[ui] 弹重启提示：%s（点击将进 %s）"
-                   % (" ".join(n for n, _a in self._toast_items),
-                      "%s(%s)" % self._toast_items[-1]))
+                   % (" ".join(n for n, _a, _p in self._toast_items),
+                      "%s(%s)" % self._toast_items[-1][:2]))
 
     def _join_latest(self):
         """点击重启提示 -> steam://connect 晚重启的那台服。成功不打扰，失败才提醒。"""
         if not self._toast_items or self.counter._movable:
             return                              # 没有可进的服；或正在拖人数条，拖动优先
-        name, addr = self._toast_items[-1]
+        name, addr = self._toast_items[-1][:2]
         ok, msg = joiner.join(addr)
         if not ok:
             self.tray.icon.showMessage("SL Restart", "加入 %s 失败：%s" % (name, msg),

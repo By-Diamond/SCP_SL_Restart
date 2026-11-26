@@ -64,7 +64,7 @@ class RoundTimerTests(unittest.TestCase):
         self.tick(None)
         self.assertEqual(self.monitor.take_restarts(), [])
         self.tick(None)
-        self.assertEqual(self.monitor.take_restarts(), [("测试服", ADDR)])
+        self.assertEqual(self.monitor.take_restarts(), [("测试服", ADDR, 5)])
 
     def test_pause_gap_and_failed_query_cancel_countdown(self):
         self.tick(2)
@@ -139,7 +139,7 @@ class RoundTimerTests(unittest.TestCase):
         self.tick(10)
         self.tick(10)
         self.tick(0)
-        self.assertEqual(self.monitor.take_restarts(), [("测试服", ADDR)])
+        self.assertEqual(self.monitor.take_restarts(), [("测试服", ADDR, 10)])
 
 
 if __name__ == "__main__":

@@ -12,9 +12,12 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 import config
+import sl_restart
+from auto_join_dialog import AutoJoinDialog
 from alerts import (NOTIFICATION_APP_ID, RestartAlerts, build_toast_xml,
                     notification_command, register_notification_identity)
 from alert_dialog import AlertDialog
@@ -59,7 +62,7 @@ class AlertTests(unittest.TestCase):
         self.assertFalse(loaded["sound_enabled"])
 
     def test_independent_switches_and_batching(self):
-        events = [("1服", "1.1.1.1:7777"), ("3服", "1.1.1.1:7779")]
+        events = [("1服", "1.1.1.1:7777", 44), ("3服", "1.1.1.1:7779", 12)]
         with patch.object(self.alerts, "play_sound") as sound, \
                 patch.object(self.alerts, "show_notification") as notify:
             self.alerts.notify_restart(events, self.cfg)
@@ -77,10 +80,10 @@ class AlertTests(unittest.TestCase):
             self.assertEqual(notify.call_count, 2)
             first = notify.call_args_list[0]
             self.assertEqual(first.args[0], "SCP:SL 服务器重启")
-            self.assertEqual(first.args[1], "[1服] 重启")
+            self.assertEqual(first.args[1], "[1服] 重启 44人")
             self.assertEqual(first.kwargs["join_url"], "slrestart://join/1.1.1.1:7777")
             second = notify.call_args_list[1]
-            self.assertEqual(second.args[1], "[3服] 重启")
+            self.assertEqual(second.args[1], "[3服] 重启 12人")
             self.assertEqual(second.kwargs["join_url"], "slrestart://join/1.1.1.1:7779")
 
     def test_notification_xml_escape_and_static_command(self):
@@ -284,9 +287,9 @@ class AlertTests(unittest.TestCase):
         self.widgets.extend([ui.counter, ui.toast])
         try:
             with patch.object(ui.alerts, "notify_restart") as notify:
-                ui._push_restart([("1服", "127.0.0.1:7777"), ("3服", "127.0.0.1:7779")])  # 本地差异：事件带地址
+                ui._push_restart([("1服", "127.0.0.1:7777", 40), ("3服", "127.0.0.1:7779", 30)])
                 notify.assert_called_once_with(
-                    [("1服", "127.0.0.1:7777"), ("3服", "127.0.0.1:7779")], self.cfg)
+                    [("1服", "127.0.0.1:7777", 40), ("3服", "127.0.0.1:7779", 30)], self.cfg)
             def finish(dlg):
                 self.widgets.append(dlg)
                 dlg.sound_enabled.setChecked(True)
@@ -297,6 +300,48 @@ class AlertTests(unittest.TestCase):
                 ui.tray.acts["alerts"].trigger()
             self.assertTrue(config.load()["sound_enabled"])
             self.assertEqual(config.load()["sound_volume"], 23)
+        finally:
+            ui.monitor.stop()
+            ui.alerts.stop()
+            ui.tray.icon.hide()
+
+    def test_auto_join_dialog_selects_checklist(self):
+        servers = [{"addr": "127.0.0.1:7777", "name": "1服", "timer": True},
+                   {"addr": "127.0.0.1:7779", "name": "3服", "timer": True}]
+        dlg = AutoJoinDialog(servers, ["127.0.0.1:7779"])
+        self.widgets.append(dlg)
+        self.assertEqual(dlg.result_addrs(), ["127.0.0.1:7779"])
+        dlg.list.item(0).setCheckState(Qt.CheckState.Checked)
+        self.assertEqual(dlg.result_addrs(), ["127.0.0.1:7777", "127.0.0.1:7779"])
+
+    def test_auto_join_fires_after_delay_and_disables(self):
+        with patch("sl_restart.Monitor.start"), patch("sl_restart.Tray.show"), \
+                patch("sl_restart.autostart.is_enabled", return_value=False):
+            ui = App(self.cfg, self.app)
+        ui.timer.stop()
+        self.widgets.extend([ui.counter, ui.toast])
+        try:
+            ui._auto_join_on = True
+            ui._auto_join_addrs = ["127.0.0.1:7779"]
+            self.cfg["windows_notifications"] = False
+            with patch("sl_restart.QTimer.singleShot") as shot, \
+                    patch.object(ui.alerts, "show_notification") as notify:
+                ui._maybe_auto_join([("1服", "127.0.0.1:7777", 40), ("3服", "127.0.0.1:7779", 30)])
+                notify.assert_called_once()
+                self.assertEqual(shot.call_args[0][0], sl_restart.AUTO_JOIN_DELAY_MS)
+                callback = shot.call_args[0][1]
+            with patch("sl_restart.joiner.join", return_value=(True, "")) as join:
+                callback()
+                join.assert_called_once_with("127.0.0.1:7779")
+            self.assertFalse(ui._auto_join_on)
+            self.assertFalse(ui.tray.acts["autojoin"].isChecked())
+
+            ui._auto_join_on = True
+            self.cfg["windows_notifications"] = True
+            with patch("sl_restart.QTimer.singleShot"), \
+                    patch.object(ui.alerts, "show_notification") as notify2:
+                ui._maybe_auto_join([("3服", "127.0.0.1:7779", 30)])
+                notify2.assert_not_called()
         finally:
             ui.monitor.stop()
             ui.alerts.stop()

@@ -36,6 +36,7 @@ class Tray:
         self.menu = QMenu()
         self.icon.setContextMenu(self.menu)
         self.acts = {}
+        self.menus = {}
 
     def add(self, key, text, callback, checkable=False, checked=False):
         a = QAction(text, self.menu)
@@ -45,6 +46,12 @@ class Tray:
         self.menu.addAction(a)
         self.acts[key] = a
         return a
+
+    def add_submenu(self, key, text):
+        """在右键菜单里挂一个二级菜单，条目由调用方自己填。"""
+        m = self.menu.addMenu(text)
+        self.menus[key] = m
+        return m
 
     def sep(self):
         self.menu.addSeparator()

@@ -11,7 +11,7 @@ import os
 import sys
 from datetime import datetime
 
-VERSION = "0.4.2"               # 单一来源：关于窗口用它；tools/version_info.txt 需手工同步
+VERSION = "0.4.3"               # 单一来源：关于窗口用它；tools/version_info.txt 需手工同步
 
 DEFAULTS = {
     "servers": [
@@ -42,6 +42,7 @@ DEFAULTS = {
     "sound_volume": 70,         # 提示音音量 0-100
     "windows_notifications": False,  # Windows 通知中心提醒（默认关闭）
     "grab_servers": [],         # 自动挤服清单：[{"addr","name","enabled","threshold"}]
+    "auto_join_servers": [],    # 重启自动进服：勾选清单里的地址（只在「编辑服务器清单…」里选）
     "third_party_api": False,   # 第三方适配：本地数据端口（托盘菜单可切）
     "api_port": 17777,          # 数据端口（只绑 127.0.0.1）
 }
@@ -116,6 +117,18 @@ def load():
         pass
     good = normalize_servers(cfg.get("servers"))
     cfg["servers"] = good or [dict(s) for s in DEFAULTS["servers"]]
+    in_list = {s["addr"] for s in cfg["servers"]}
+    raw = cfg.get("auto_join_servers")
+    clean, seen = [], set()
+    for item in raw if isinstance(raw, list) else ():
+        parsed = parse_addr(str(item))
+        if not parsed:
+            continue
+        addr = "%s:%d" % parsed
+        if addr in in_list and addr not in seen:   # 只认服务器清单里的服
+            seen.add(addr)
+            clean.append(addr)
+    cfg["auto_join_servers"] = clean
     for key in ("sound_enabled", "windows_notifications", "show_timer", "show_counter",
                 "show_toast", "third_party_api"):
         if not isinstance(cfg[key], bool):

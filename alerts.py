@@ -219,15 +219,17 @@ class RestartAlerts(QObject):
         self._identity_registered = False
 
     def notify_restart(self, events, cfg):
-        """events = [(服名, 地址)]：一台服一条通知，标题/正文维持原样，各带「进服」按钮。"""
+        """events = [(服名, 地址, 人数)]：一台服一条通知，正文「[x服] 重启 x人」，各带「进服」按钮。"""
         if not events:
             return
         if cfg.get("sound_enabled", False):
             self.play_sound(cfg.get("sound_file", ""), cfg.get("sound_volume", 70))
         if cfg.get("windows_notifications", False):
-            for name, addr in events:
-                self.show_notification("SCP:SL 服务器重启",
-                                       "[%s] 重启" % name,
+            for name, addr, players in events:
+                message = "[%s] 重启" % name
+                if players is not None:
+                    message += " %d人" % int(players)      # 过去 10 秒内的最高人数
+                self.show_notification("SCP:SL 服务器重启", message,
                                        join_url=join_url_for(addr),
                                        api_port=cfg.get("api_port") or 17777)
 

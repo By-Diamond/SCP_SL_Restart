@@ -1,7 +1,7 @@
 # ANCHOR — SL Restart
 
 > 给接手的大模型 / 协作者看的项目锚点。读完这份就能改代码，不必翻全部历史。
-> 最后更新：2026-10-31（v0.4.2）
+> 最后更新：2026-11-26（v0.4.3）
 
 ## 1. 这是什么
 
@@ -28,7 +28,7 @@ sl_restart.py (UI 线程)
   ├─ tray.py（托盘菜单）
   ├─ alerts.py（声音 + Windows 通知）
   ├─ api_server.py（可选 127.0.0.1:17777/snapshot）
-  └─ 各 QDialog：server_dialog / grab_dialog / alert_dialog / about
+  └─ 各 QDialog：server_dialog / grab_dialog / auto_join_dialog / alert_dialog / about
 ```
 
 **硬规则**：UI 线程不碰 socket、不碰文件；监控线程不碰 Qt。
@@ -45,7 +45,7 @@ sl_restart.py (UI 线程)
 | `api_server.py` | 只读 HTTP（`GET /snapshot`、`GET /join?addr=`、`GET /`），只绑回环 |
 | `tray.py` / `autostart.py` / `joiner.py` | 托盘图标菜单、开机自启（HKCU）、steam 直连 |
 | `a2s.py` | 极简 A2S_INFO 查询（不依赖第三方库） |
-| `server_dialog.py` / `grab_dialog.py` / `alert_dialog.py` / `about.py` | 四个对话框 |
+| `server_dialog.py` / `grab_dialog.py` / `auto_join_dialog.py` / `alert_dialog.py` / `about.py` | 对话框（清单 / 挤服 / 重启自动进服 / 提醒设置 / 关于） |
 | `tools/gui_check.py` | 离屏 GUI 自检（托盘回调 / 弹窗 / 对话框） |
 | `tests/verify_*.py` | 逻辑、提醒、拖动、回合估算 |
 
@@ -64,6 +64,7 @@ sl_restart.py (UI 线程)
 | `restart_seconds` | `10` | 红字提示停留秒数 |
 | `sound_enabled` / `windows_notifications` | `False` | 两种提醒开关 |
 | `grab_servers` | `[]` | 自动挤服清单 `[{"addr","name","enabled","threshold"}]` |
+| `auto_join_servers` | `[]` | 重启自动进服勾选的地址（只保留清单里存在的，启动时功能默认关） |
 | `third_party_api` | `False` | 本地数据端口开关（状态持久化） |
 | `api_port` | `17777` | 只绑 `127.0.0.1` |
 
@@ -109,6 +110,8 @@ waiting ──人数≥门槛──> countdown ──等够 delay──> running
 5. **空服抑制**：判定为重启时，若过去 `QUIET_WINDOW_S=10s` 内所有采样都 ≤ `QUIET_MAX_PLAYERS=2`、且这 10 秒没开过局
    （`_started_at` 不在窗口内，当前也不是 `running`）→ 只写 `events.log`「忽略重启」，**不弹提示、不进 `_pending`**；
    时长 / 阶段照常重置。采样历史存在 `_recent[addr]`（`deque[(monotonic, players)]`，只留 10 秒）。
+6. **重启事件带人数**：进 `_pending` 的是 `(服名, 地址, 人数)`，人数 = `_peak_players()` 取 `_recent` 里过去 10 秒最高值
+   （没历史则回退归零前那次人数）；Windows Toast 正文因此是 `[x服] 重启 x人`，红字提示框仍只显示 `[x服] 重启`。
 
 ## 7. 运行产物（exe 同目录）
 
@@ -150,10 +153,13 @@ build.bat            :: PyInstaller 单文件 → dist\SL Restart.exe
 
 ## 11. 当前状态
 
-1. 版本 `0.4.2`；`dist\SL Restart.exe` 已按最新代码打包（59,211,455 字节，`FileVersion = 0.4.2`）。
-2. 本轮改动：满员 1 秒加速开局（`FULL_START_GRACE_S` / `_full_since`）、空服重启抑制（`QUIET_WINDOW_S` / `_recent`）、
-   时间栏改「等待 0:45」且不够门槛留空；第三方适配新增 `GET /join`、快照新增 `phase` / `countdown`，
-   灵动岛按钮改走本地接口（不再起新进程解包）。
-3. `README.md` 与本文件已同步新规则。
-4. git：v0.4.1 已推送（`3dc2219`）；v0.4.2 改动见本次提交。
-5. `dist\旧版_4849_可删.exe` 是上一版残留，旧实例退出后可直接删。
+1. 版本 `0.4.3`；`dist\SL Restart.exe`（59,635,947 字节，11-26 20:54）已含本轮全部改动，
+   已实测启动正常、本地端口 `127.0.0.1:17777/snapshot` 返回 200。
+2. 0.4.3 新增：**重启自动进服**（清单多选、任意一台重启 **0.1 秒**后进服、一次只进一台）、
+   Windows Toast 正文带 **过去 10 秒峰值人数**（`[x服] 重启 x人`）、
+   **托盘「进服」二级菜单**（列清单服名，点服名直接进服，清单改动后自动刷新）、测试与文档同步。
+3. 0.4.2 已发布内容：满员 1 秒加速开局（`FULL_START_GRACE_S` / `_full_since`）、空服重启抑制
+   （`QUIET_WINDOW_S` / `_recent`）、时间栏「等待 0:45」且人数不够门槛留空、第三方适配
+   `GET /join` + 快照 `phase` / `countdown`、灵动岛按钮走本地接口。
+4. git：v0.4.2 已提交推送（`d641f02`）；v0.4.3 见本次提交。
+5. `dist\SL_Restart_v0.4.2_portable.exe` 是上一版残留（旧实例已退出），确认新版没问题后可删。

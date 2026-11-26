@@ -61,19 +61,31 @@ def main():
     pump(app, 0.5)
     t = ui.tray
 
-    keys = ("counter", "timer", "move_counter", "pause", "refresh", "grab",
+    keys = ("counter", "timer", "move_counter", "pause", "refresh", "grab", "autojoin",
             "servers", "alerts", "api", "autostart", "about", "quit")
-    check("托盘菜单十二项齐全",
+    check("托盘菜单十三项动作齐全（另有「进服」子菜单）",
           set(t.acts) == set(keys),
           sorted(t.acts))
     check("菜单文案：显示人数条 / 显示回合时长 / 移动人数条 / 暂停监控 / 立即刷新 / 自动挤服 / "
-          "编辑服务器清单… / 提醒设置… / 第三方适配 / 开机自启 / 关于 / 退出程序",
+          "重启自动进服 / 编辑服务器清单… / 提醒设置… / 第三方适配 / 开机自启 / 关于 / 退出程序",
           [t.acts[k].text() for k in keys]
           == ["显示人数条", "显示回合时长", "移动人数条", "暂停监控", "立即刷新", "自动挤服",
-              "编辑服务器清单…", "提醒设置…", "第三方适配", "开机自启", "关于", "退出程序"],
+              "重启自动进服", "编辑服务器清单…", "提醒设置…", "第三方适配", "开机自启",
+              "关于", "退出程序"],
           [t.acts[k].text() for k in keys])
     check("「显示回合时长」默认勾选（默认全开）", t.acts["timer"].isChecked())
     check("「显示人数条」默认勾选（默认显示）", t.acts["counter"].isChecked())
+
+    join_menu = t.menus.get("join")
+    join_names = [a.text() for a in join_menu.actions()] if join_menu else []
+    check("「进服」子菜单：标题 + 按清单列服名",
+          join_menu is not None and join_menu.title() == "进服"
+          and join_names == ["1服", "3服", "5服"], join_names)
+    with patch("sl_restart.joiner.join", return_value=(True, "steam://connect/x")) as join:
+        join_menu.actions()[1].trigger()
+        check("点「进服」子菜单 -> 进对应服务器",
+              join.call_args is not None
+              and join.call_args[0][0] == "180.188.21.179:7779", join.call_args)
     check("「第三方适配」默认关闭（默认不起本地端口）",
           not t.acts["api"].isChecked() and not ui.api.running)
     check("人数条默认显示、重启提示默认不显示",
@@ -143,7 +155,7 @@ def main():
     # 回归：服务器重启弹提示时，不许把用户关掉的人数条弹回来
     ui.toast.set_visible(False)
     with ui.monitor._lock:
-        ui.monitor._pending.append(("3服", "127.0.0.1:7779"))
+        ui.monitor._pending.append(("3服", "127.0.0.1:7779", 40))
     ui._sync()
     pump(app, 0.2)
     check("重启提示弹出时人数条仍然隐藏（提示自己正常显示）",
@@ -228,7 +240,7 @@ def main():
     ui.monitor.set_servers(cfg["servers"])              # 换回真实清单，后面的用例继续用
 
     with ui.monitor._lock:
-        ui.monitor._pending.append(("3服", "127.0.0.1:7779"))
+        ui.monitor._pending.append(("3服", "127.0.0.1:7779", 40))
     ui._sync()
     pump(app, 0.2)
     check("重启事件 -> 弹窗显示「[3服] 重启」",
@@ -246,7 +258,7 @@ def main():
     ui.toast.set_visible(False)
     ui.toast._timer.stop()
     with ui.monitor._lock:
-        ui.monitor._pending.extend([("1服", "127.0.0.1:7777"), ("3服", "127.0.0.1:7779")])
+        ui.monitor._pending.extend([("1服", "127.0.0.1:7777", 40), ("3服", "127.0.0.1:7779", 30)])
     ui._sync()
     pump(app, 0.2)
     check("同一轮两台服重启 -> 并排显示「[1服] [3服] 重启」",
@@ -351,7 +363,7 @@ def main():
     pump(app, 1.5)                                    # 让倒计时先走掉一部分
     left_before = ui.toast._timer.remainingTime()
     with ui.monitor._lock:
-        ui.monitor._pending.append(("5服", "127.0.0.1:7781"))
+        ui.monitor._pending.append(("5服", "127.0.0.1:7781", 20))
     ui._sync()
     pump(app, 0.2)
     left_after = ui.toast._timer.remainingTime()
@@ -364,12 +376,12 @@ def main():
     # 提示放完之后，旧服名不许残留
     ui.toast.duration = 0.4
     with ui.monitor._lock:
-        ui.monitor._pending.append(("3服", "127.0.0.1:7779"))
+        ui.monitor._pending.append(("3服", "127.0.0.1:7779", 40))
     ui._sync()
     pump(app, 1.4)
     check("提示自动消失后旧服名被清掉", not ui.toast.isVisible())
     with ui.monitor._lock:
-        ui.monitor._pending.append(("1服", "127.0.0.1:7777"))
+        ui.monitor._pending.append(("1服", "127.0.0.1:7777", 40))
     ui._sync()
     pump(app, 0.2)
     check("下一次重启只显示本次的服名「[1服] 重启」",
@@ -396,7 +408,7 @@ def main():
     ui.cfg["show_toast"] = False                       # 关掉提示框：重启只走日志/通知
     ui.toast.set_visible(False)
     with ui.monitor._lock:
-        ui.monitor._pending.append(("1服", "127.0.0.1:7777"))
+        ui.monitor._pending.append(("1服", "127.0.0.1:7777", 40))
     ui._sync()
     pump(app, 0.3)
     check("关掉「启用重启提示框」后不再弹提示", not ui.toast.isVisible())
